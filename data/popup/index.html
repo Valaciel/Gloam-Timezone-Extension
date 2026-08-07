@@ -1,0 +1,281 @@
+<!DOCTYPE html>
+<html lang="en" data-theme="system">
+  <head>
+    <meta charset="utf-8">
+    <title>Gloam TZ</title>
+    <link rel="stylesheet" href="popup.css">
+    <!-- Before the stylesheet has anything to paint, so the popup never opens
+         in the wrong theme and corrects itself a frame later. -->
+    <script src="popup-theme.js"></script>
+  </head>
+  <body>
+    <form id="form" novalidate>
+      <header class="head">
+        <div class="brand">
+          <img class="logo" src="../icons/icon-48.png" alt="" width="28" height="28">
+          <div>
+            <h1>Gloam TZ</h1>
+            <!-- The toolbar dot, in words, for the tab you are looking at.
+                 The full explanation is the title, so the header stays one line. -->
+            <p class="status" id="status" role="status" aria-live="polite">
+              <span class="status__dot" aria-hidden="true"></span>
+              <span class="status__text" id="statusText">Checking this tab…</span>
+            </p>
+          </div>
+        </div>
+        <label class="switch" title="Enable timezone override">
+          <input type="checkbox" id="enabled" checked>
+          <span class="track"><span class="thumb"></span></span>
+        </label>
+      </header>
+
+      <div class="shell">
+        <nav class="nav" role="tablist" aria-label="Sections" aria-orientation="vertical">
+          <button class="nav__item is-current" type="button" role="tab"
+                  id="tabZones" data-panel="panelZones"
+                  aria-controls="panelZones" aria-selected="true" title="Timezone">
+            <svg viewBox="0 0 24 24" aria-hidden="true">
+              <circle cx="12" cy="12" r="8.5"></circle>
+              <path d="M12 7.2V12l3.2 2"></path>
+            </svg>
+            <span class="nav__label">Zone</span>
+          </button>
+
+          <button class="nav__item" type="button" role="tab"
+                  id="tabSites" data-panel="panelSites"
+                  aria-controls="panelSites" aria-selected="false" title="Sites">
+            <svg viewBox="0 0 24 24" aria-hidden="true">
+              <circle cx="12" cy="12" r="8.5"></circle>
+              <path d="M3.5 12h17"></path>
+              <path d="M12 3.5c2.4 2.5 3.6 5.4 3.6 8.5s-1.2 6-3.6 8.5c-2.4-2.5-3.6-5.4-3.6-8.5s1.2-6 3.6-8.5z"></path>
+            </svg>
+            <span class="nav__label">Sites</span>
+          </button>
+
+          <button class="nav__item" type="button" role="tab"
+                  id="tabConnections" data-panel="panelConnections"
+                  aria-controls="panelConnections" aria-selected="false" title="Connections">
+            <svg viewBox="0 0 24 24" aria-hidden="true">
+              <circle cx="12" cy="5" r="2.6"></circle>
+              <circle cx="5" cy="18" r="2.6"></circle>
+              <circle cx="19" cy="18" r="2.6"></circle>
+              <path d="M10.4 7.1 6.3 15.6M13.6 7.1l4.1 8.5M7.6 18h8.8"></path>
+            </svg>
+            <span class="nav__label">Links</span>
+            <span class="nav__badge" id="connectionsBadge" hidden></span>
+          </button>
+
+          <button class="nav__item" type="button" role="tab"
+                  id="tabGeneral" data-panel="panelGeneral"
+                  aria-controls="panelGeneral" aria-selected="false" title="General">
+            <svg viewBox="0 0 24 24" aria-hidden="true">
+              <path d="M4 7h10M18 7h2M4 17h4M12 17h8"></path>
+              <circle cx="16" cy="7" r="2.2"></circle>
+              <circle cx="10" cy="17" r="2.2"></circle>
+            </svg>
+            <span class="nav__label">General</span>
+          </button>
+
+          <button class="nav__item" type="button" role="tab"
+                  id="tabAbout" data-panel="panelAbout"
+                  aria-controls="panelAbout" aria-selected="false" title="About">
+            <svg viewBox="0 0 24 24" aria-hidden="true">
+              <circle cx="12" cy="12" r="8.5"></circle>
+              <path d="M12 11v5.2"></path>
+              <path d="M12 7.9v.1"></path>
+            </svg>
+            <span class="nav__label">About</span>
+          </button>
+        </nav>
+
+        <main class="body">
+          <p class="notice" id="notice" hidden></p>
+
+          <!-- ------------------------------------------------------ zone -->
+          <section class="panel is-current" id="panelZones" role="tabpanel" aria-labelledby="tabZones">
+            <div class="card">
+              <div class="row">
+                <label class="label" for="zoneSearch">Timezone</label>
+                <input class="field" type="search" id="zoneSearch" placeholder="Filter zones…"
+                       autocomplete="off" spellcheck="false">
+              </div>
+              <select class="field select" id="zoneSelect" size="1"></select>
+              <p class="hint" id="zonePreview">&nbsp;</p>
+
+              <label class="check">
+                <input type="checkbox" id="randomPerTab">
+                <span>Pick a random timezone per tab</span>
+              </label>
+            </div>
+          </section>
+
+          <!-- ----------------------------------------------------- sites -->
+          <section class="panel" id="panelSites" role="tabpanel" aria-labelledby="tabSites" hidden>
+            <div class="card">
+              <div class="label label--block">Where it applies</div>
+              <div class="segmented" role="radiogroup" aria-label="Where it applies">
+                <label>
+                  <input type="radio" name="siteMode" value="all" checked>
+                  <span>All sites</span>
+                </label>
+                <label>
+                  <input type="radio" name="siteMode" value="listed">
+                  <span>Allowlist</span>
+                </label>
+                <label>
+                  <input type="radio" name="siteMode" value="blocked">
+                  <span>Blocklist</span>
+                </label>
+              </div>
+
+              <div id="listSection" class="list-wrap" hidden>
+                <p class="hint" id="listHint"></p>
+                <textarea id="listText" spellcheck="false" autocomplete="off"
+                          placeholder="example.com&#10;*.google.com"></textarea>
+                <p class="hint hint--muted">One host per line. <code>example.com</code> also covers its subdomains.</p>
+              </div>
+
+              <div class="backup">
+                <span class="counts" id="listCounts"></span>
+                <button class="link" type="button" id="exportButton">Export</button>
+                <button class="link" type="button" id="importButton">Import</button>
+                <input type="file" id="importFile" hidden
+                       accept=".json,.txt,.csv,application/json,text/plain,text/csv">
+              </div>
+            </div>
+          </section>
+
+          <!-- ----------------------------------------------- connections -->
+          <section class="panel" id="panelConnections" role="tabpanel"
+                   aria-labelledby="tabConnections" hidden>
+            <div class="card">
+              <div class="conn-head">
+                <div>
+                  <div class="label label--block">Connected to</div>
+                  <p class="hint hint--muted" id="connectionsSummary">Reading this tab…</p>
+                </div>
+                <button class="link" type="button" id="connectionsRefresh">Rescan</button>
+              </div>
+
+              <div class="conn-target">
+                <span class="conn-target__label">Add to</span>
+                <div class="segmented segmented--pair" role="radiogroup" aria-label="List to add to">
+                  <label>
+                    <input type="radio" name="connTarget" value="listed">
+                    <span>Allowlist</span>
+                  </label>
+                  <label>
+                    <input type="radio" name="connTarget" value="blocked" checked>
+                    <span>Blocklist</span>
+                  </label>
+                </div>
+              </div>
+
+              <button class="btn btn--small" type="button" id="connectionsAddAll">
+                Add everything this site connects to
+              </button>
+
+              <p class="hint hint--muted conn-note" id="connectionsNote" hidden></p>
+            </div>
+
+            <div class="card card--flush conn-list" id="connectionsList"></div>
+          </section>
+
+          <!-- --------------------------------------------------- general -->
+          <section class="panel" id="panelGeneral" role="tabpanel" aria-labelledby="tabGeneral" hidden>
+            <div class="card">
+              <div class="label label--block">Theme</div>
+              <div class="segmented" role="radiogroup" aria-label="Theme">
+                <label>
+                  <input type="radio" name="theme" value="system" checked>
+                  <span>System</span>
+                </label>
+                <label>
+                  <input type="radio" name="theme" value="light">
+                  <span>Light</span>
+                </label>
+                <label>
+                  <input type="radio" name="theme" value="dark">
+                  <span>Dark</span>
+                </label>
+              </div>
+              <p class="hint hint--muted">Light is Gold, dark is Navy — the logo's own
+                colours. Applies straight away; no need to save.</p>
+            </div>
+
+            <div class="card">
+              <div class="label label--block">Status dot</div>
+              <p class="hint hint--muted">The same colour appears on the toolbar icon
+                and beside the name above, for the tab you are on.</p>
+              <ul class="legend">
+                <li class="legend__item is-masked">
+                  <span class="legend__dot" aria-hidden="true"></span>
+                  <span><b>Masked</b> — the override was in place before the page ran.</span>
+                </li>
+                <li class="legend__item is-unverified">
+                  <span class="legend__dot" aria-hidden="true"></span>
+                  <span><b>Unverified</b> — masked, but it loaded late, so a script at
+                    the top of the page could have read the real timezone first.</span>
+                </li>
+                <li class="legend__item is-leaked">
+                  <span class="legend__dot" aria-hidden="true"></span>
+                  <span><b>Leak</b> — something on the page saw the real timezone.</span>
+                </li>
+                <li class="legend__item is-off">
+                  <span class="legend__dot" aria-hidden="true"></span>
+                  <span><b>Off</b> — not covering this page, by design: the override is
+                    off, or the site is out of scope.</span>
+                </li>
+              </ul>
+            </div>
+          </section>
+
+          <!-- ----------------------------------------------------- about -->
+          <section class="panel" id="panelAbout" role="tabpanel" aria-labelledby="tabAbout" hidden>
+            <div class="card about">
+              <img class="about__logo" src="../icons/icon-128.png" alt="" width="64" height="64">
+              <h2 class="about__name">Gloam Timezone Extension</h2>
+              <p class="about__version" id="aboutVersion"></p>
+              <p class="about__blurb">Reports a timezone of your choosing to every site
+                you visit. Nothing is collected, and nothing leaves your machine.</p>
+<<<<<<< HEAD
+              <p class="about__source">Open source, so you can check that for
+                yourself — read the code on
+                <a href="https://github.com/Valaciel/Gloam-Timezone-Extension"
+                  target="_blank" rel="noopener noreferrer">GitHub</a>.</p>
+              <p class="about__legal">
+                © 2020–2026 ·
+                <a href="https://Valaciel.com/" target="_blank" rel="noopener noreferrer">Valaciel™</a>
+                · Gloam™ ·
+                <a href="https://www.gnu.org/licenses/gpl-3.0.html"
+                  target="_blank" rel="noopener noreferrer">GPL-3.0</a>
+=======
+              <p class="about__legal">
+                © 2020–2026 ·
+                <a href="https://Valaciel.com/" target="_blank" rel="noopener noreferrer">Valaciel™</a>
+                · All Rights Reserved
+>>>>>>> 2e93fd1 (Say the coverage state in the header, and stop shouting it over every panel)
+              </p>
+            </div>
+          </section>
+        </main>
+      </div>
+
+      <footer class="foot">
+        <button class="btn btn--ghost" type="button" id="resetButton">Reset</button>
+        <span class="message" id="message" role="status" aria-live="polite"></span>
+        <button class="btn btn--primary" type="submit">Save</button>
+      </footer>
+    </form>
+
+    <!-- popup-theme.js is loaded in <head>; everything else can wait for the DOM. -->
+    <script src="../offsets.js"></script>
+    <script src="../../js/site-rules.js"></script>
+    <script src="popup-shared.js"></script>
+    <script src="popup-nav.js"></script>
+    <script src="popup-zones.js"></script>
+    <script src="popup-sites.js"></script>
+    <script src="popup-connections.js"></script>
+    <script src="index.js"></script>
+  </body>
+</html>

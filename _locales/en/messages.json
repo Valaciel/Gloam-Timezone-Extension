@@ -1,0 +1,8 @@
+{
+   "application_description": {
+      "message": "Override your browser timezone locally. No tracking, no external requests, and an optional allowlist or blocklist of sites."
+   },
+   "application_title": {
+      "message": "Gloam Timezone Extension"
+   }
+}
