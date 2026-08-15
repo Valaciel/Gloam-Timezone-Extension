@@ -117,20 +117,28 @@ scope.
 
 A small dot in the top-right corner of the toolbar icon, per tab. The popup
 carries the same dot in its header, next to the name, with a one-line label —
-*Masked*, *Masked · unverified*, *Real timezone leaked* — and the full sentence
-on hover. The colours are written out under **General ▸ Status dot**.
+*Masked*, *Masked · unverified*, *Masked · worker not covered*, *Real timezone
+leaked* — and the full sentence on hover. The colours are written out under
+**General ▸ Status dot**.
 
 | Dot | Meaning |
 | --- | --- |
 | 🟢 green | **Masked.** The hook was already in place before the content script ran, so it beat the page's own scripts. |
-| 🟠 amber | **Masked, not verified.** The hook is installed, but *we* installed it from the content script after an async storage read. A script at the top of the page could have read the clock first — we cannot tell whether one did. |
-| 🔴 red | **Leaked.** Something definitely saw the real timezone: the hook never installed, or a worker had to run unpatched. |
+| 🟡 amber | **Masked, not verified.** The hook is installed, but *we* installed it from the content script after an async storage read. A script at the top of the page could have read the clock first — we cannot tell whether one did. |
+| 🟠 orange | **Worker not covered.** The page itself is masked, but a Web Worker on it ran unmasked. This site's policy blocks the only way we can reach into one, and reaching in anyway would have stopped the worker running at all. |
+| 🔴 red | **Leaked.** The page itself saw the real timezone: the hook never installed, or the mask was off for a bot check. |
 | none | Not covering this page by design — override off, or the site is out of scope. |
 
-Green versus amber is the whole point of having three states. "We injected the
-hook" is not the same claim as "nothing read the clock before us", and a privacy
-tool that blurs the two is lying to its user. In practice, turning on "Allow
-user scripts" is what turns amber into green.
+Green versus amber is the whole point of having the first two states. "We
+injected the hook" is not the same claim as "nothing read the clock before us",
+and a privacy tool that blurs the two is lying to its user. In practice, turning
+on "Allow user scripts" is what turns amber into green.
+
+Red is reserved for the page's own world. An uncovered worker is a real leak and
+gets its own colour to say so, but it is a gap in one corner of a page that is
+otherwise masked — and almost every site starts a worker sooner or later, so
+painting that the same red as "the override never ran" told you nothing you
+could act on.
 
 Frames report independently and the worst answer in a tab wins — a leak in an ad
 iframe is still a leak.
@@ -212,11 +220,19 @@ ones the dot exists to tell you about.
   reads the clock in its very first inline script can see the real timezone.
   This is the default state of a fresh install, and it is the single biggest
   reason to enable the toggle. Shows as an amber dot.
-- **Workers on strict-CSP sites.** Hooked workers are booted from a generated
-  `blob:` URL. Where a Content-Security-Policy forbids `blob:` workers, the
-  extension falls back to the page's original worker, which sees the real
-  timezone. Keeping the site working is preferred over breaking it. Shows as a
-  red dot.
+- **URL-based workers on strict-CSP sites.** A worker started from an ordinary
+  URL can only be hooked by re-pointing it at a generated `blob:` URL — a change
+  the site never asked for. Where a Content-Security-Policy forbids `blob:`
+  workers that does not fail quietly: the worker constructs, dies a moment
+  later, and whatever it was running disappears from the page. So the rewrite
+  waits on a probe that says `blob:` workers run at all here, and where they do
+  not, the worker is passed through and sees the real timezone. Shows as an
+  orange dot.
+
+  Workers the page itself started inline — `new Worker(URL.createObjectURL(…))`
+  or a `data:` URL — are always covered, on every site. The page has just proved
+  `blob:` workers are allowed by minting one, and the hook is prepended to the
+  original `Blob` in memory rather than fetched, so no CSP directive is in play.
 - **A hand-edited offset does not reach `Temporal`.** `Temporal` is told the
   zone name, not the adjustment, so it reports that zone's real offset. Picking
   a zone rather than typing an offset avoids this entirely.

@@ -689,6 +689,25 @@ var installTimezoneHook = function installTimezoneHook(settings) {
      * We can't reach inside a worker after it starts, so we replace the script
      * it boots from: a small generated script that installs this hook first,
      * then loads the page's real worker code.
+     *
+     * The replacement has to be a blob: URL, and that is not free. On a site
+     * whose policy forbids blob: workers it does not fail quietly - the worker
+     * constructs, dies a moment later, and whatever it was running is gone from
+     * the page. So the rule we go by is: do nothing at the URL layer that the
+     * site has not already committed to itself.
+     *
+     *   inline worker      new Worker(URL.createObjectURL(blob)), or a data:
+     *                      URL. The site just minted one, so blob: workers
+     *                      plainly run here. Always rewritten.
+     *
+     *   URL worker         new Worker('/w.js'). Rewriting is our idea, not the
+     *                      site's, so it waits on a probe that says blob:
+     *                      workers are allowed - and where they are not, the
+     *                      worker is passed through untouched.
+     *
+     * A worker we passed through sees the real timezone. That is worth saying
+     * out loud in the popup, and it is NOT the same thing as the page itself
+     * leaking, so it does not turn the toolbar dot red.
      * ================================================================== */
 
     /* ------------------------------------------------------------------ *
@@ -759,26 +778,137 @@ var installTimezoneHook = function installTimezoneHook(settings) {
         }
     }
 
+    const canCreateBlobUrls = typeof globalThis.Blob === 'function'
+        && typeof URL !== 'undefined' && typeof URL.createObjectURL === 'function';
+
+    // Captured before the shim below goes on, so our own blob URLs neither go
+    // through it nor end up tracked.
+    const realCreateObjectURL = canCreateBlobUrls ? URL.createObjectURL.bind(URL) : null;
+    const realRevokeObjectURL = canCreateBlobUrls ? URL.revokeObjectURL.bind(URL) : null;
+
+    /* ------------------------------------------------------------------ *
+     * Holding on to the page's own worker blobs
+     *
+     * When a page builds a worker inline - new Worker(URL.createObjectURL(blob))
+     * - the only way to get in front of its code is to read that code. Every
+     * route that reads a blob: URL at runtime goes through the network layer:
+     * fetch and XHR are governed by connect-src, importScripts and <script src>
+     * by script-src. A strict policy commonly allows blob: under worker-src and
+     * nowhere else, so all of them are refused.
+     *
+     * The one thing no directive governs is holding the Blob object itself. So
+     * we shim URL.createObjectURL, keep the Blob it was handed, and later build
+     * `new Blob([prelude, thatBlob])` - concatenation in memory, no request, no
+     * directive to violate.
+     *
+     * The reference is weak and dropped on revokeObjectURL, so this never keeps
+     * a page's blobs alive past their welcome.
+     * ------------------------------------------------------------------ */
+
+    const trackedBlobs = new Map();
+
+    /*
+     * A page is under no obligation to revoke the URLs it mints, and some churn
+     * through thousands of them - image previews, downloads, video segments. The
+     * Blob references are weak, so those pages are not held in memory by us, but
+     * the map entries themselves would pile up. So once the map is big enough to
+     * notice, drop every entry whose Blob has already been collected.
+     */
+    const TRACKED_BLOB_LIMIT = 256;
+
+    const pruneTrackedBlobs = () => {
+        for (const [url, reference] of trackedBlobs) {
+            if (!reference.deref()) {
+                trackedBlobs.delete(url);
+            }
+        }
+
+        // Everything is still live: this page is genuinely holding that many
+        // blobs at once. Forget the oldest rather than grow without limit - a
+        // worker built from one of those would run unpatched, which is the same
+        // outcome as any other blob we cannot read.
+        while (trackedBlobs.size > TRACKED_BLOB_LIMIT) {
+            trackedBlobs.delete(trackedBlobs.keys().next().value);
+        }
+    };
+
+    if (canCreateBlobUrls) {
+        const WeakReference = typeof WeakRef === 'function' ? WeakRef : null;
+
+        URL.createObjectURL = markAsNative(object => {
+            const url = realCreateObjectURL(object);
+            try {
+                if (object instanceof Blob) {
+                    if (trackedBlobs.size >= TRACKED_BLOB_LIMIT) {
+                        pruneTrackedBlobs();
+                    }
+                    trackedBlobs.set(url, WeakReference
+                        ? new WeakReference(object)
+                        : { deref: () => object });
+                }
+            }
+            catch (e) {
+                // instanceof can throw across realms; not worth tracking then.
+            }
+            return url;
+        }, 'createObjectURL');
+
+        URL.revokeObjectURL = markAsNative(url => {
+            trackedBlobs.delete(url);
+            return realRevokeObjectURL(url);
+        }, 'revokeObjectURL');
+    }
+
+    /** The Blob a blob: URL was minted from, if we still have it. */
+    const trackedBlobFor = url => {
+        const reference = trackedBlobs.get(url);
+        if (!reference) {
+            return null;
+        }
+        const blob = reference.deref();
+        if (!blob) {
+            trackedBlobs.delete(url);
+            return null;
+        }
+        return blob;
+    };
+
+    /** The source text of a data: URL, or null if it will not decode. */
+    const decodeDataUrl = url => {
+        const comma = url.indexOf(',');
+        if (comma === -1) {
+            return null;
+        }
+        const meta = url.slice(5, comma);
+        const body = url.slice(comma + 1);
+        try {
+            return meta.includes(';base64') ? atob(body) : decodeURIComponent(body);
+        }
+        catch (e) {
+            return null;
+        }
+    };
+
     /*
      * Can we run a blob: worker on this page?
      *
-     * Plenty of sites set a Content-Security-Policy that forbids them. A
-     * blocked worker does NOT throw - it constructs happily and then fires an
-     * error event a moment later, far too late for us to quietly hand back an
-     * unmodified worker instead. Wrapping optimistically would therefore break
-     * the page's workers outright on those sites.
+     * Only asked about workers the page started from an ordinary URL, where
+     * rewriting to a blob: is a change the site never asked for. Plenty of
+     * sites set a Content-Security-Policy that forbids them, and a blocked
+     * worker does NOT throw - it constructs happily and then fires an error
+     * event a moment later, far too late for us to quietly hand back an
+     * unmodified worker instead. Rewriting optimistically would take the
+     * feature that worker was running off the page entirely.
      *
-     * So we settle the question once with a throwaway worker, and only start
-     * rewriting worker scripts after it comes back successfully. Workers
-     * created during that brief window run unpatched, which leaks the real
-     * timezone but keeps the site working - the right way round.
+     * So we settle the question once with a throwaway worker, and leave
+     * URL-based workers alone until it comes back.
      */
     let blobWorkersAllowed = false;
 
     const probeBlobWorkerSupport = RealWorkerConstructor => {
         let probeUrl = null;
         try {
-            probeUrl = URL.createObjectURL(new Blob(['self.postMessage(0);'], { type: 'text/javascript' }));
+            probeUrl = realCreateObjectURL(new Blob(['self.postMessage(0);'], { type: 'text/javascript' }));
             const probe = new RealWorkerConstructor(probeUrl);
 
             const finish = allowed => {
@@ -789,7 +919,7 @@ var installTimezoneHook = function installTimezoneHook(settings) {
                 catch (e) {
                     // Already gone.
                 }
-                URL.revokeObjectURL(probeUrl);
+                realRevokeObjectURL(probeUrl);
             };
 
             probe.onmessage = () => finish(true);
@@ -797,7 +927,7 @@ var installTimezoneHook = function installTimezoneHook(settings) {
         }
         catch (e) {
             if (probeUrl) {
-                URL.revokeObjectURL(probeUrl);
+                realRevokeObjectURL(probeUrl);
             }
         }
     };
@@ -833,48 +963,144 @@ var installTimezoneHook = function installTimezoneHook(settings) {
         }
     };
 
+    /**
+     * A worker the page built inline, with our prelude in front of its code.
+     *
+     * Safe on every site, whatever its policy: the page has just minted a
+     * blob: or data: URL and handed it to a worker, so blob: workers are
+     * demonstrably allowed here. Our replacement is a blob: URL on the same
+     * origin, and lands inside the same allowance.
+     *
+     * The prelude inherits no base URL. An inline worker's own `location` was
+     * already a blob: or data: URL that its relative paths could not resolve
+     * against, and it is one afterwards too, so nothing about the worker's view
+     * of itself changes.
+     */
+    const startInlineWorker = (RealWorkerConstructor, scriptUrl, urlText, options, isModule) => {
+        /*
+         * A module worker resolves its imports against its own URL, and ours is
+         * a different blob. Leave it be - bundlers ship module workers from
+         * ordinary URLs anyway, which take the other path.
+         */
+        if (isModule || !canCreateBlobUrls) {
+            reportStatus('worker');
+            return new RealWorkerConstructor(scriptUrl, options);
+        }
+
+        let generatedUrl = null;
+        try {
+            const prelude = workerPreludeFor(null);
+
+            if (urlText.startsWith('blob:')) {
+                const original = trackedBlobFor(urlText);
+                if (original) {
+                    generatedUrl = realCreateObjectURL(
+                        new Blob([prelude, original], { type: 'text/javascript' }),
+                    );
+                }
+            }
+            else {
+                const source = decodeDataUrl(urlText);
+                if (source !== null) {
+                    generatedUrl = realCreateObjectURL(
+                        new Blob([prelude + source], { type: 'text/javascript' }),
+                    );
+                }
+            }
+
+            if (generatedUrl === null) {
+                /*
+                 * The URL was minted before we were installed, or has already
+                 * been revoked, or the data: URL would not decode. There is
+                 * nothing to read, so the worker runs as the page wrote it.
+                 */
+                reportStatus('worker');
+                return new RealWorkerConstructor(scriptUrl, options);
+            }
+
+            const worker = new RealWorkerConstructor(generatedUrl, options);
+
+            // The blob has to outlive construction while the worker fetches
+            // it; a generous delay is safer than revoking immediately.
+            setTimeout(() => realRevokeObjectURL(generatedUrl), 60000);
+            return worker;
+        }
+        catch (e) {
+            if (generatedUrl) {
+                realRevokeObjectURL(generatedUrl);
+            }
+            reportStatus('worker');
+            return new RealWorkerConstructor(scriptUrl, options);
+        }
+    };
+
+    /**
+     * A worker the page started from an ordinary URL.
+     *
+     * Here the blob: rewrite is a change the site never asked for, and it costs
+     * something even where it is allowed: the worker's `location` becomes the
+     * blob rather than its own script. We repair that below, but the repair is
+     * ours to get wrong, so this only happens once the probe says blob: workers
+     * run on this site at all. Everywhere else the worker is passed through
+     * untouched - it sees the real timezone, and the page keeps working.
+     */
+    const startUrlWorker = (RealWorkerConstructor, urlText, options, isModule) => {
+        const realScriptUrl = resolveWorkerUrl(urlText);
+
+        if (!blobWorkersAllowed || !canCreateBlobUrls) {
+            reportStatus('worker');
+            return new RealWorkerConstructor(realScriptUrl, options);
+        }
+
+        let generatedUrl = null;
+        try {
+            // Module workers have no importScripts(), so they use import().
+            const bootstrap = workerPreludeFor(realScriptUrl) + (isModule
+                ? `import(${JSON.stringify(realScriptUrl)});`
+                : `importScripts(${JSON.stringify(realScriptUrl)});`);
+
+            generatedUrl = realCreateObjectURL(new Blob([bootstrap], { type: 'text/javascript' }));
+
+            const worker = new RealWorkerConstructor(generatedUrl, options);
+
+            setTimeout(() => realRevokeObjectURL(generatedUrl), 60000);
+            return worker;
+        }
+        catch (e) {
+            if (generatedUrl) {
+                realRevokeObjectURL(generatedUrl);
+            }
+            reportStatus('worker');
+            return new RealWorkerConstructor(realScriptUrl, options);
+        }
+    };
+
     const patchWorkerConstructor = (RealWorkerConstructor, constructorName) => {
         function PatchedWorker(scriptUrl, options) {
-            // Not yet proven safe (or proven unsafe): leave the worker alone,
-            // beyond making sure its URL still resolves. This worker gets to
-            // see the real timezone, so the toolbar dot should say so.
-            if (!blobWorkersAllowed) {
-                reportStatus('worker');
-                return new RealWorkerConstructor(resolveWorkerUrl(scriptUrl), options);
-            }
-
-            let generatedUrl = null;
+            let urlText;
             try {
-                const realScriptUrl = resolveWorkerUrl(scriptUrl);
-
-                // Module workers have no importScripts(), so they use import().
-                const isModule = options && typeof options === 'object' && options.type === 'module';
-                const bootstrap = workerPreludeFor(realScriptUrl) + (isModule
-                    ? `import(${JSON.stringify(realScriptUrl)});`
-                    : `importScripts(${JSON.stringify(realScriptUrl)});`);
-
-                generatedUrl = URL.createObjectURL(new Blob([bootstrap], { type: 'text/javascript' }));
-
-                const worker = new RealWorkerConstructor(generatedUrl, options);
-
-                // The blob has to outlive construction while the worker fetches
-                // it; a generous delay is safer than revoking immediately.
-                setTimeout(() => URL.revokeObjectURL(generatedUrl), 60000);
-                return worker;
+                urlText = scriptUrl instanceof URL ? scriptUrl.href : String(scriptUrl);
             }
             catch (e) {
-                /*
-                 * Most likely a Content-Security-Policy that forbids blob:
-                 * workers. Fall back to the page's original worker: it will see
-                 * the real timezone, but the page keeps working, which matters
-                 * more than a leak on a handful of strict sites.
-                 */
-                if (generatedUrl) {
-                    URL.revokeObjectURL(generatedUrl);
-                }
-                reportStatus('worker');
-                return new RealWorkerConstructor(resolveWorkerUrl(scriptUrl), options);
+                // A Symbol, or an object whose toString throws. Not ours to
+                // fix: hand it to the real constructor and let it complain.
+                return new RealWorkerConstructor(scriptUrl, options);
             }
+
+            const isModule = !!options && typeof options === 'object' && options.type === 'module';
+
+            /*
+             * Which of the two paths a worker takes turns entirely on whether
+             * the page chose an inline URL itself. Anything it did choose we
+             * can safely rewrite; anything it did not, we mostly leave alone.
+             */
+            if (urlText.startsWith('blob:') || urlText.startsWith('data:')) {
+                return startInlineWorker(
+                    RealWorkerConstructor, scriptUrl, urlText, options, isModule,
+                );
+            }
+
+            return startUrlWorker(RealWorkerConstructor, urlText, options, isModule);
         }
 
         PatchedWorker.prototype = RealWorkerConstructor.prototype;
@@ -890,9 +1116,6 @@ var installTimezoneHook = function installTimezoneHook(settings) {
      * Dedicated workers can spawn their own workers, and this hook runs inside
      * those too - so the patch follows the page down every level of nesting.
      */
-    const canCreateBlobUrls = typeof globalThis.Blob === 'function'
-        && typeof URL !== 'undefined' && typeof URL.createObjectURL === 'function';
-
     if (canCreateBlobUrls && typeof globalThis.Worker === 'function') {
         // The same CSP directive governs both kinds of worker, so one probe
         // answers for both.

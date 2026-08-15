@@ -221,6 +221,11 @@ h1 {
   --dot-halo: rgba(245, 158, 11, 0.18);
 }
 
+.status.is-partial, .legend__item.is-partial {
+  --dot: #f97316;
+  --dot-halo: rgba(249, 115, 22, 0.18);
+}
+
 .status.is-leaked, .legend__item.is-leaked {
   --dot: #ef4444;
   --dot-halo: rgba(239, 68, 68, 0.18);

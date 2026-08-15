@@ -14,14 +14,22 @@
  *                       content script, after an async storage read - so a
  *                       script running at the top of the page could have got
  *                       there first. We cannot tell whether one did.
- *   red     leaked      something definitely saw the real timezone: the hook
- *                       never installed, or a worker had to run unpatched
+ *   orange  partial     the page itself is masked, but a Web Worker on it had
+ *                       to run unpatched and saw the real timezone
+ *   red     leaked      the page itself saw the real timezone: the hook never
+ *                       installed, or the mask was off for a bot check
  *   none    off         we are not covering this page, by design (override
  *                       switched off, or the site is out of scope)
  *
  * The distinction between green and amber is the whole point. "We injected the
  * hook" is not the same claim as "nothing read the clock before us", and a
  * privacy tool that blurs the two is lying to its user.
+ *
+ * Red is reserved for the page's own world. A worker we could not cover is a
+ * real leak and says so, in its own colour - but it is a gap in one corner of
+ * a page that is otherwise masked, and colouring it the same as "the override
+ * never ran" told the user nothing they could act on. Almost every site starts
+ * a worker sooner or later.
  *
  * Frames report independently and the worst answer in a tab wins: a leak in an
  * ad iframe is still a leak.
@@ -30,11 +38,12 @@
 var tabStatus = {};
 
 // Worst last. A frame may only ever move a tab further down this list.
-const SEVERITY = ['off', 'masked', 'unverified', 'leaked'];
+const SEVERITY = ['off', 'masked', 'unverified', 'partial', 'leaked'];
 
 const DOT_COLOUR = {
     masked: '#22c55e',
     unverified: '#f59e0b',
+    partial: '#f97316',
     leaked: '#ef4444',
 };
 
@@ -45,13 +54,16 @@ const TOOLTIP = {
         + 'fallback path, so a script at the top of the page could have read the real '
         + 'timezone first. Turn on "Allow user scripts" on chrome://extensions to close '
         + 'this gap.',
+    partial: 'Gloam TZ - masked, with a gap. The page is covered, but a Web Worker '
+        + 'on it ran unmasked.',
     leaked: 'Gloam TZ - leak. Something on this page saw the real timezone.',
 };
 
 // Appended to the tooltip when we know what went wrong.
 const REASON = {
-    worker: ' A Web Worker had to run unmasked, because this site\'s security '
-        + 'policy blocks the way we normally cover them.',
+    worker: ' This site\'s security policy blocks the way we normally cover '
+        + 'workers, so covering it anyway would have stopped the worker running '
+        + 'at all.',
     'no-hook': ' The override could not be installed on this page at all.',
     challenge: ' The mask was off for a bot check, and this page loaded before it '
         + 'could go back on. Reload to browse masked.',

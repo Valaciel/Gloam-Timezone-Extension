@@ -25,6 +25,7 @@
 const STATUS_LABEL = {
     masked: 'Masked',
     unverified: 'Masked · unverified',
+    partial: 'Masked · worker not covered',
     leaked: 'Real timezone leaked',
     off: 'Not masking this tab',
     disabled: 'Override is off',
@@ -35,6 +36,8 @@ const STATUS_DETAIL = {
     masked: 'This tab is masked — the override was in place before the page ran.',
     unverified: 'This tab is masked, but not verified — the override loaded late, '
         + 'so a script at the top of the page could have read the real timezone first.',
+    partial: 'This tab is masked, but a Web Worker on it ran unmasked and saw the '
+        + 'real timezone.',
     leaked: 'This tab leaked — something on it saw the real timezone.',
     off: 'Nothing is being masked here: this page is out of scope, or it is not a '
         + 'page the override can run on.',
@@ -42,10 +45,10 @@ const STATUS_DETAIL = {
     unknown: '',
 };
 
-// Only shown for a leak, where knowing which one it was is actionable.
+// Only shown for a gap or a leak, where knowing which one it was is actionable.
 const STATUS_REASON = {
-    worker: ' A Web Worker ran unmasked: this site’s security policy blocks the '
-        + 'way we normally cover them.',
+    worker: ' This site’s security policy blocks the way we normally cover workers, '
+        + 'and covering it anyway would have stopped the worker running at all.',
     'no-hook': ' The override could not be installed on this page at all.',
     challenge: ' The mask was off for a bot check, and this page loaded before it '
         + 'could go back on. Reload to browse masked.',
@@ -70,7 +73,8 @@ function renderEnabled() {
             : 'unknown';
 
     const detail = STATUS_DETAIL[state]
-        + (state === 'leaked' ? (STATUS_REASON[tabCoverage && tabCoverage.reason] || '') : '');
+        + (state === 'leaked' || state === 'partial'
+            ? (STATUS_REASON[tabCoverage && tabCoverage.reason] || '') : '');
 
     popup.el.status.className = `status is-${state}`;
     popup.el.status.title = detail;

@@ -217,9 +217,15 @@
                   <span><b>Unverified</b> — masked, but it loaded late, so a script at
                     the top of the page could have read the real timezone first.</span>
                 </li>
+                <li class="legend__item is-partial">
+                  <span class="legend__dot" aria-hidden="true"></span>
+                  <span><b>Worker not covered</b> — the page is masked, but a Web Worker
+                    on it ran unmasked. Covering it would have stopped it running.</span>
+                </li>
                 <li class="legend__item is-leaked">
                   <span class="legend__dot" aria-hidden="true"></span>
-                  <span><b>Leak</b> — something on the page saw the real timezone.</span>
+                  <span><b>Leak</b> — something on the page itself saw the real
+                    timezone.</span>
                 </li>
                 <li class="legend__item is-off">
                   <span class="legend__dot" aria-hidden="true"></span>

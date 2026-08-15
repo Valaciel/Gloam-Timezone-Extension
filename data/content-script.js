@@ -187,7 +187,7 @@ function watchForLaterReports() {
 
     new MutationObserver(() => {
         if (readReportedStatus() === 'worker') {
-            sendStatus('leaked', 'worker');
+            sendStatus('partial', 'worker');
         }
     }).observe(root, { attributes: true, attributeFilter: [statusChannel] });
 }
@@ -296,7 +296,7 @@ function injectAndReport(hookArguments) {
                 return true;
             }
             if (reported === 'worker') {
-                sendStatus('leaked', 'worker');
+                sendStatus('partial', 'worker');
                 return true;
             }
             return false;
@@ -365,7 +365,7 @@ function start(stored) {
         return;
     }
     if (initialReport === 'worker') {
-        sendStatus('leaked', 'worker');
+        sendStatus('partial', 'worker');
         return;
     }
 

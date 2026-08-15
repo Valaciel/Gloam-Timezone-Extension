@@ -5,12 +5,56 @@ All notable changes to the Gloam Timezone Extension are recorded here.
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and
 the project uses [semantic versioning](https://semver.org/spec/v2.0.0.html).
 
-<<<<<<< HEAD
 1.0.2 is the first public version. The two entries below it are development
 history, kept because the code they describe is what you are reading; neither
 was ever distributed. Early commits carry `1.0.1` in the manifest throughout —
 the numbering was settled when this file was written, and 1.0.0 is what that
 first build is called here.
+
+## 1.0.3 — 2026-08-15
+
+The toolbar dot stops crying wolf, and inline Web Workers are covered on sites
+that previously blocked every route into them.
+
+### Fixed
+
+- **Every site turned red a few seconds after it loaded.** Worker patching was
+gated behind a probe that fires a throwaway `blob:` worker and waits for it to
+report back. Until that round trip finished, every worker the page built took
+the "not proven safe" branch and reported a leak — and most sites start a
+worker a moment after load, for analytics or video or maps. The dot went green,
+then red, on essentially everything. Worker coverage no longer turns on that
+probe alone, and an uncovered worker no longer reports as a page leak.
+
+### Changed
+
+- **Workers are patched by how the page built them, not by what a probe says.**
+A worker the page started *inline* — `new Worker(URL.createObjectURL(…))`, or
+a `data:` URL — is now always covered, on every site. The page has just proved
+`blob:` workers run there by minting one itself, so our replacement lands
+inside the same allowance it did. A worker started from an ordinary URL is a
+different matter: re-pointing it at a generated `blob:` is a change the site
+never asked for, and where a Content-Security-Policy forbids that, the worker
+does not fail quietly — it constructs, dies a moment later, and whatever it was
+running disappears from the page. Those still wait on the probe, and where
+`blob:` workers are refused they are passed through untouched.
+- **Red on the toolbar dot now means the page itself.** An uncovered worker is a
+real leak and still says so, in its own orange state — but it is a gap in one
+corner of a page that is otherwise masked, and painting it the same red as "the
+override never ran" told you nothing you could act on. Red is now reserved for
+the hook never installing, or the mask being off for a bot check.
+
+### Added
+
+- **A fourth toolbar state: orange, *Masked · worker not covered*.** The page is
+masked, but a Web Worker on it ran unmasked. Listed in **General ▸ Status dot**
+alongside the other three.
+- Inline workers are now covered even on sites with a strict CSP. Reading a
+`blob:` URL's bytes at runtime means `fetch`, `XMLHttpRequest`, `importScripts`
+or a `<script src>`, and a policy that allows `blob:` under `worker-src`
+commonly refuses all four. The hook now keeps a weak reference to the `Blob`
+itself as the page mints it, and prepends the override to it in memory, where
+no policy directive applies.
 
 ## 1.0.2 — 2026-08-07
 
@@ -33,17 +77,10 @@ the logo and icon set are not. Fork it freely under a name of your own.
 
 The popup rebuilt around an icon rail, a Links panel for seeing what a page
 actually talks to, and two brand themes.
-=======
-## 1.0.1 — 2026-08-07
-
-The popup rebuilt around an icon rail, a Links panel for seeing what a page
-actually talks to, and two brand themes. The extension version is unchanged.
->>>>>>> 2e93fd1 (Say the coverage state in the header, and stop shouting it over every panel)
 
 ### Added
 
 - **Links panel.** Lists every domain the current tab has fetched from, grouped
-<<<<<<< HEAD
 by registrable domain, with one click to add the exact host, the whole domain
 (`*.example.com`), or all of them to the allowlist or blocklist. The list is
 read from the page's own Resource Timing entries in every frame, so it needs
@@ -69,34 +106,12 @@ with one panel mounted at a time, so nothing you click makes the window grow.
 the current tab rather than only what was configured.
 - Styled scrollbars in the popup, in the current theme's ink rather than the
 platform's default grey.
-=======
-  by registrable domain, with one click to add the exact host, the whole domain
-  (`*.example.com`), or all of them to the allowlist or blocklist. The list is
-  read from the page's own Resource Timing entries in every frame, so it needs
-  no extra permission — at the cost of not seeing WebSocket or in-Worker
-  traffic.
-- **Themes.** Gold (light) and Navy (dark), the app icon's own colours, or
-  *System* to follow the OS. Applies on click rather than on Save, and survives
-  `Reset` along with the site lists. A `localStorage` mirror of the choice lets
-  the popup paint in the right colours on the first frame instead of flipping a
-  frame later.
-- **Status in the popup header.** The toolbar dot repeated next to the name, as
-  a coloured dot and a short label — green *Masked*, amber *Masked ·
-  unverified*, red *Real timezone leaked*, grey for off or out of scope — with
-  the full explanation on hover. **General ▸ Status dot** spells out what each
-  colour means.
-- **Sidebar navigation.** Five sections — Zone, Sites, Links, General, About —
-  with one panel mounted at a time, so nothing you click makes the window grow.
-- Styled scrollbars in the popup, in the current theme's ink rather than the
-  platform's default grey.
 - `Asset/` is now tracked: the logo artwork and the palette both themes are
-  built from.
->>>>>>> 2e93fd1 (Say the coverage state in the header, and stop shouting it over every panel)
+built from.
 
 ### Changed
 
 - The per-tab coverage banner is gone. It spent three lines above every panel
-<<<<<<< HEAD
 saying what the toolbar dot already said in one dot; that verdict now lives in
 the header status above.
 - Toolbar and store icons redesigned, and re-exported smaller at every size.
@@ -163,23 +178,3 @@ settings are compiled into the script itself and registered through
 nothing to await, so it lands before any page script. A content script serves
 as the fallback when that toggle is off.
 - No data collection, no external requests, no accounts.
-=======
-  saying what the toolbar dot already said in one dot; that verdict now lives in
-  the header status above.
-- Toolbar and store icons redesigned, and re-exported smaller at every size.
-- README covers the popup, the Links panel and the themes.
-
-### Removed
-
-- The 42 translated `_locales` bundles, which only ever held the extension name
-  and description while the interface itself was English throughout. `en`
-  remains.
-- The manual offset tweak on top of the chosen zone. A zone already carries its
-  own offset, DST included, and an offset laid over it produced a clock that
-  matched no real place — the exact inconsistency a bot check looks for.
-
----
-
-Earlier work — the initial 1.0.1 release and the masking fixes that followed —
-predates this file and is recorded in the commit history.
->>>>>>> 2e93fd1 (Say the coverage state in the header, and stop shouting it over every panel)
