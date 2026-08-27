@@ -1,7 +1,6 @@
                     GNU GENERAL PUBLIC LICENSE
                        Version 3, 29 June 2007
 
-<<<<<<< HEAD
  Copyright (C) 2007 Free Software Foundation, Inc. <https://fsf.org/>
  Everyone is permitted to copy and distribute verbatim copies
  of this license document, but changing it is not allowed.
@@ -673,6 +672,3 @@ may consider it more useful to permit linking proprietary applications with
 the library.  If this is what you want to do, use the GNU Lesser General
 Public License instead of this License.  But first, please read
 <https://www.gnu.org/licenses/why-not-lgpl.html>.
-=======
-No part of this extension, function or code can be reproduced, distributed, or transmitted in any form or by any means—including digital scraping, AI training, photocopying, recording, or other electronic or mechanical ethods—without the prior written permission of the author, except in the case of brief quotations embodied in reviews.
->>>>>>> 2e93fd1 (Say the coverage state in the header, and stop shouting it over every panel)

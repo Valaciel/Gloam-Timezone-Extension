@@ -11,6 +11,16 @@ was ever distributed. Early commits carry `1.0.1` in the manifest throughout —
 the numbering was settled when this file was written, and 1.0.0 is what that
 first build is called here.
 
+## 1.0.4 — 2026-08-27
+
+Unresolved merge conflict markers had been committed into the shipped extension.
+
+### Fixed
+
+- **`LICENSE`, About panel, and popup styles showed raw `<<<<<<< HEAD` markers.**
+A botched merge left conflict syntax in three files. Resolved in favour of the
+GPL-3.0 licence and the open-source About text (GitHub link, GPL-3.0 link).
+
 ## 1.0.3 — 2026-08-15
 
 The toolbar dot stops crying wolf, and inline Web Workers are covered on sites

@@ -39,5 +39,5 @@
    "offline_enabled": true,
    "permissions": [ "scripting", "storage", "userScripts" ],
    "short_name": "Gloam TZ",
-   "version": "1.0.3"
+   "version": "1.0.4"
 }

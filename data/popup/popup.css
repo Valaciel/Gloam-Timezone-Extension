@@ -912,7 +912,6 @@ textarea#listText:focus {
   color: var(--text-dim);
 }
 
-<<<<<<< HEAD
 .about__source {
   margin: 2px 0 0;
   font-size: 11.5px;
@@ -920,8 +919,6 @@ textarea#listText:focus {
   color: var(--text-dim);
 }
 
-=======
->>>>>>> 2e93fd1 (Say the coverage state in the header, and stop shouting it over every panel)
 .about__legal {
   margin: 8px 0 0;
   padding-top: 9px;
@@ -931,10 +928,7 @@ textarea#listText:focus {
   color: var(--text-dim);
 }
 
-<<<<<<< HEAD
 .about__source a,
-=======
->>>>>>> 2e93fd1 (Say the coverage state in the header, and stop shouting it over every panel)
 .about__legal a {
   color: var(--accent);
   font-weight: 600;
@@ -942,18 +936,12 @@ textarea#listText:focus {
   border-bottom: 1px solid transparent;
 }
 
-<<<<<<< HEAD
 .about__source a:hover,
-=======
->>>>>>> 2e93fd1 (Say the coverage state in the header, and stop shouting it over every panel)
 .about__legal a:hover {
   border-bottom-color: currentColor;
 }
 
-<<<<<<< HEAD
 .about__source a:focus-visible,
-=======
->>>>>>> 2e93fd1 (Say the coverage state in the header, and stop shouting it over every panel)
 .about__legal a:focus-visible {
   outline: 2px solid var(--accent);
   outline-offset: 2px;
