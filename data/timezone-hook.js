@@ -1,1134 +1,701 @@
-'use strict';
-
 /*
- * The timezone hook.
- * =================
+ * Gloam Timezone Extension — data/timezone-hook.js
  *
- * This is the code that actually lies to the page. It replaces `Date` and
- * `Intl.DateTimeFormat` so that every way a page can ask "what timezone is
- * this browser in?" gets the same made-up answer.
+ * Runs in the page's MAIN world at document_start (declared in manifest.json),
+ * ensuring it executes before any page script or inline code can run.
  *
- * There are two questions a page can ask, and they must never disagree:
- *
- *   1. The zone NAME   - Intl.DateTimeFormat().resolvedOptions().timeZone
- *   2. The WALL CLOCK  - new Date().getTimezoneOffset(), .getHours(), .toString()
- *
- * Patching only one of them is trivially detectable, so we do both. `Temporal`
- * asks the same two questions through its own door, so it is covered too.
- *
- * This file only DEFINES the function. It never runs on its own. Three
- * different places load it and run it:
- *
- *   - background.js  reads its source and registers it as an early-running
- *                    user script (the fast path that always wins the race)
- *   - content-script.js  runs it as a fallback when that path is unavailable
- *   - the hook itself    re-runs it inside any Web Worker the page creates
- *
- * It must therefore never touch `document` or anything else that only exists
- * in a normal page - Web Workers have no DOM.
+ * Core Capabilities:
+ *   1. Consistent Local-Time Model: All local time operations flow through
+ *      offsetAt() and localToUTC() adhering strictly to ECMA-262 (including
+ *      DST transitions and skipped/repeated local times).
+ *   2. Zero-Allocation Prototype Patching: Mutates Date.prototype in-place.
+ *      Does not subclass Date or create per-instance WeakMap partner objects.
+ *      Reuses a single scratch Date for getters, giving O(1) memory footprint.
+ *   3. Dynamic Iframe Interception: Hooks HTMLIFrameElement.prototype.contentWindow
+ *      and contentDocument to immediately patch dynamic / about:blank frames
+ *      before page scripts can inspect unpatched native prototypes.
+ *   4. Clean Intl.DateTimeFormat: Replaces constructor without wrapping instances
+ *      in a Proxy, maintaining full V8 private slot integrity and performance.
+ *   5. Deep V8 Engine Emulation: Replicates Chromium's EquivalentYear logic for
+ *      historical/future dates and CLDR timezone fallbacks.
+ *   6. Native Disguises: Function.prototype.toString returns authentic [native code]
+ *      for all patched functions.
  */
 
-// eslint-disable-next-line no-unused-vars
-var installTimezoneHook = function installTimezoneHook(settings) {
-    if (!Array.isArray(settings) || settings.length < 4) {
-        return;
-    }
+(function () {
+  'use strict';
 
-    // Guard against running twice in one context. This matters because the
-    // fast path and the fallback path can both fire on the same page; whoever
-    // gets there first wins and the second one quietly does nothing.
-    const INSTALLED_FLAG = '__gloam_timezone_installed__';
-    if (Object.prototype.hasOwnProperty.call(globalThis, INSTALLED_FLAG)) {
-        return;
-    }
-    Object.defineProperty(globalThis, INSTALLED_FLAG, {
-        value: true,
-        enumerable: false,
-        configurable: false,
-        writable: false,
-    });
+  const DAY = 86400000;
+  const MAX_TIME = 8.64e15;
 
-    const [
-        timezoneName, chosenOffsetMinutes, , fallbackZoneLabel,
-        inheritedBaseUrl, statusChannel,
-    ] = settings;
+  const EVT_CFG = '__gloam_tz_cfg';
+  const EVT_REQ = '__gloam_tz_req';
+  const EVT_ACK = '__gloam_tz_ack';
+  const FRAME_MARK = Symbol.for('__gloam_tz_frame');
 
-    /* ------------------------------------------------------------------ *
-     * Telling the toolbar dot what happened
-     *
-     * The content script sits in the extension's isolated world and cannot
-     * see anything we do in here, so we leave it a note somewhere both worlds
-     * can reach: an attribute on <html>. The attribute NAME is a random value
-     * the extension generates each browser session and hands to both sides, so
-     * a page cannot simply watch for a name it knows in advance. The content
-     * script removes the attribute as soon as it has read it.
-     *
-     * Workers have no DOM, so there this is a no-op - which costs us nothing,
-     * because the one worker leak we can detect is detected out here in the
-     * page, at the moment we hand back an unpatched worker.
-     * ------------------------------------------------------------------ */
+  function install(root) {
+    const NativeDate = root.Date;
+    const NativeIntl = root.Intl;
+    const NativeDTF = NativeIntl ? NativeIntl.DateTimeFormat : undefined;
+    const FnProto = root.Function.prototype;
+    const OrigFnToString = FnProto.toString;
+    const apply = Reflect.apply;
+    const construct = Reflect.construct;
+    const defineProperty = Object.defineProperty;
+    const P = NativeDate.prototype;
 
-    const reportStatus = (() => {
-        if (!statusChannel || typeof document === 'undefined') {
-            return () => {};
-        }
+    // ---- Captured natives (immune to later tampering by the page) ----------
+    const nativeNow = NativeDate.now;
+    const nativeParse = NativeDate.parse;
+    const nativeUTC = NativeDate.UTC;
+    const N = {};
+    [
+      'getTime', 'setTime',
+      'getUTCFullYear', 'getUTCMonth', 'getUTCDate', 'getUTCDay',
+      'getUTCHours', 'getUTCMinutes', 'getUTCSeconds', 'getUTCMilliseconds',
+      'setUTCFullYear', 'setUTCMonth', 'setUTCDate', 'setUTCHours',
+      'setUTCMinutes', 'setUTCSeconds', 'setUTCMilliseconds',
+    ].forEach((k) => { N[k] = P[k]; });
 
-        let latest = null;
-
-        const write = () => {
-            const root = document.documentElement;
-            if (!root || !latest) {
-                return;
-            }
-            try {
-                root.setAttribute(statusChannel, latest);
-            }
-            catch (e) {
-                // Nothing useful to do; the dot stays unverified, which is the
-                // honest answer when we cannot confirm anything.
-            }
-        };
-
-        return status => {
-            // Once something has leaked, it stays leaked. "masked" is the only
-            // status a later one is allowed to overwrite.
-            if (latest !== null && latest !== 'masked') {
-                return;
-            }
-            latest = status;
-
-            // At document_start <html> can still be a moment away.
-            if (document.documentElement) {
-                write();
-            }
-            else {
-                setTimeout(write, 0);
-            }
-        };
-    })();
-
-    /*
-     * What relative worker URLs are resolved against.
-     *
-     * Normally that is just the current location. Inside a worker we started,
-     * though, `location` is the generated blob: URL we booted it from, which
-     * relative paths cannot resolve against - so we pass the worker's real
-     * script URL down as a fifth setting and use that instead.
-     */
-    const baseUrlForWorkers = inheritedBaseUrl
-        || (globalThis.location ? globalThis.location.href : undefined);
-
-    // Grab the real implementations before we start replacing things.
-    const RealDate = Date;
-    const RealDateTimeFormat = Intl.DateTimeFormat;
-    const realGetTimezoneOffset = RealDate.prototype.getTimezoneOffset;
-    const realFunctionToString = Function.prototype.toString;
-
-    // Our own source code, captured now so we can re-inject it into any Web
-    // Worker later. It has to be read before we start masking toString(),
-    // otherwise we would read back the fake "[native code]" string.
-    const hookSource = realFunctionToString.call(installTimezoneHook);
-
-    /* ================================================================== *
-     * Disguising our functions as native ones
-     *
-     * A page can detect a patched builtin by printing it:
-     *     Date.toString()  ->  "class ShiftedDate extends ..."  (busted)
-     * Real builtins print as "function Date() { [native code] }", so we keep
-     * a registry of our replacements and make toString() lie about them.
-     * ================================================================== */
-
-    const nativeLookalikes = new WeakMap();
-
-    const markAsNative = (fn, displayName) => {
-        try {
-            Object.defineProperty(fn, 'name', { value: displayName, configurable: true });
-        }
-        catch (e) {
-            // Some functions have a non-configurable name; the toString
-            // disguise below still applies, which is the part pages check.
-        }
-        nativeLookalikes.set(fn, displayName);
-        return fn;
-    };
-
-    const fakeFunctionToString = function toString() {
-        const displayName = nativeLookalikes.get(this);
-        if (displayName !== undefined) {
-            return 'function ' + displayName + '() { [native code] }';
-        }
-        // Anything we did not touch prints its real source, as it should.
-        return realFunctionToString.call(this);
-    };
-    markAsNative(fakeFunctionToString, 'toString');
-    Function.prototype.toString = fakeFunctionToString;
-
-    /* ================================================================== *
-     * Working out the offset for a given moment
-     *
-     * A fixed offset would be a giveaway: a genuine America/New_York browser
-     * reports -300 in January and -240 in July. So instead of trusting one
-     * stored number, we ask the browser's own timezone database what the
-     * offset was at each specific moment.
-     *
-     * The trick: format the timestamp as wall-clock text in the target zone,
-     * then read that text back as if it were UTC. The gap between the two is
-     * the zone's offset at that moment.
-     * ================================================================== */
-
-    const zonePartsFormatter = new RealDateTimeFormat('en-US', {
-        timeZone: timezoneName,
-        year: 'numeric', month: '2-digit', day: '2-digit',
-        hour: '2-digit', minute: '2-digit', second: '2-digit',
-        hourCycle: 'h23',
-    });
-
-    const zoneLabelFormatter = new RealDateTimeFormat('en-US', {
-        timeZone: timezoneName,
-        timeZoneName: 'long',
-    });
-
-    // Offsets and labels only change at DST boundaries, so results are cached
-    // per hour. Without this, date-heavy pages would pay for a full Intl
-    // format on every single Date they construct.
+    // ---- State -------------------------------------------------------------
+    const state = { active: false, tz: null, offFmt: null, nameFmt: null, refNames: null };
     const offsetCache = new Map();
-    const labelCache = new Map();
-    const cacheKeyFor = milliseconds => Math.floor(milliseconds / 3600000);
+    const OFFSET_CACHE_LIMIT = 4096;
+    const scratch = new NativeDate(0); // reused by getters only
 
-    const forgetOldest = cache => {
-        if (cache.size > 4096) {
-            cache.clear();
-        }
+    const registry = new WeakMap(); // fake function -> native-looking source text
+    const register = (fn, name) => {
+      registry.set(fn, 'function ' + name + '() { [native code] }');
     };
 
-    /**
-     * The offset of the fake zone at a given moment, in getTimezoneOffset()'s
-     * convention: minutes to ADD to local time to reach UTC. So New York in
-     * summer is +240, not -240.
-     */
-    const zoneOffsetAt = milliseconds => {
-        if (!Number.isFinite(milliseconds)) {
-            return chosenOffsetMinutes;
-        }
-
-        const key = cacheKeyFor(milliseconds);
-        const cached = offsetCache.get(key);
-        if (cached !== undefined) {
-            return cached;
-        }
-
-        let offset;
+    function setConfig(cfg) {
+      let ok = false;
+      if (cfg && cfg.enabled && typeof cfg.timezone === 'string' && cfg.timezone && NativeDTF) {
         try {
-            const parts = zonePartsFormatter.formatToParts(new RealDate(milliseconds));
-            const partValue = type => {
-                const part = parts.find(candidate => candidate.type === type);
-                return part ? Number(part.value) : 0;
-            };
-
-            const year = partValue('year');
-            let asIfUtc = RealDate.UTC(
-                year, partValue('month') - 1, partValue('day'),
-                partValue('hour'), partValue('minute'), partValue('second'),
-            );
-
-            // Date.UTC maps years 0-99 onto 1900-1999; undo that for old dates.
-            if (year >= 0 && year < 100) {
-                const corrected = new RealDate(asIfUtc);
-                corrected.setUTCFullYear(year);
-                asIfUtc = corrected.getTime();
-            }
-
-            offset = -Math.round((asIfUtc - milliseconds) / 60000);
+          const offFmt = new NativeDTF('en-US-u-ca-gregory-nu-latn', {
+            timeZone: cfg.timezone, hourCycle: 'h23', era: 'short',
+            year: 'numeric', month: 'numeric', day: 'numeric',
+            hour: 'numeric', minute: 'numeric', second: 'numeric',
+          });
+          const nameFmt = new NativeDTF('en-US', { timeZone: cfg.timezone, timeZoneName: 'long' });
+          state.tz = cfg.timezone;
+          state.offFmt = offFmt;
+          state.nameFmt = nameFmt;
+          ok = true;
+        } catch (e) {
+          ok = false;
         }
-        catch (e) {
-            offset = chosenOffsetMinutes;
-        }
-
-        forgetOldest(offsetCache);
-        offsetCache.set(key, offset);
-        return offset;
-    };
-
-    /** The zone's human label at a moment, e.g. "Eastern Daylight Time". */
-    const zoneLabelAt = milliseconds => {
-        if (!Number.isFinite(milliseconds)) {
-            return fallbackZoneLabel;
-        }
-
-        const key = cacheKeyFor(milliseconds);
-        const cached = labelCache.get(key);
-        if (cached !== undefined) {
-            return cached;
-        }
-
-        let label = fallbackZoneLabel;
-        try {
-            const parts = zoneLabelFormatter.formatToParts(new RealDate(milliseconds));
-            const namePart = parts.find(candidate => candidate.type === 'timeZoneName');
-            if (namePart && namePart.value) {
-                label = namePart.value;
-            }
-        }
-        catch (e) {
-            // Keep the stored fallback label.
-        }
-
-        forgetOldest(labelCache);
-        labelCache.set(key, label);
-        return label;
-    };
-
-    /*
-     * If the user hand-edited the offset in Advanced settings, their number
-     * won't match what the zone database says. We keep that difference and
-     * apply it on top of the real DST-aware offset, so a manual tweak still
-     * behaves correctly across a DST boundary.
-     */
-    const manualAdjustmentMinutes = (() => {
-        const difference = chosenOffsetMinutes - zoneOffsetAt(RealDate.now());
-        return Number.isFinite(difference) ? difference : 0;
-    })();
-
-    /** What we tell the page its offset is, at a given moment. */
-    const fakeOffsetAt = milliseconds => zoneOffsetAt(milliseconds) + manualAdjustmentMinutes;
-
-    /** What this machine's offset actually is, at a given moment. */
-    const realOffsetAt = milliseconds => realGetTimezoneOffset.call(new RealDate(milliseconds));
-
-    /*
-     * How far to slide a timestamp so that reading it with the machine's real
-     * clock produces the wall-clock time of the fake zone. This is the single
-     * idea the whole Date patch is built on.
-     */
-    const clockShiftAt = milliseconds => (realOffsetAt(milliseconds) - fakeOffsetAt(milliseconds)) * 60000;
-
-    /* ================================================================== *
-     * Intl.DateTimeFormat
-     *
-     * Every formatter defaults to our fake zone. If the page explicitly asks
-     * for a specific zone we honour that - a page formatting a meeting in
-     * Asia/Tokyo should still get Tokyo.
-     * ================================================================== */
-
-    function DateTimeFormat(locales, options) {
-        const formatterOptions = { ...(options || {}) };
-        if (formatterOptions.timeZone === undefined) {
-            formatterOptions.timeZone = timezoneName;
-        }
-
-        const realFormatter = new RealDateTimeFormat(locales, formatterOptions);
-
-        // A Proxy lets every method work exactly as normal while we override
-        // just the one call that would reveal the substitution.
-        return new Proxy(realFormatter, {
-            get(target, property) {
-                if (property === 'resolvedOptions') {
-                    const reportOptions = () => {
-                        const report = RealDateTimeFormat.prototype.resolvedOptions.call(target);
-                        report.timeZone = formatterOptions.timeZone;
-                        return report;
-                    };
-                    return markAsNative(reportOptions, 'resolvedOptions');
-                }
-
-                const value = Reflect.get(target, property, target);
-                return typeof value === 'function' ? value.bind(target) : value;
-            },
-        });
+      }
+      offsetCache.clear();
+      localeFormatters.clear();
+      state.refNames = null;
+      state.active = ok;
+      if (!ok) {
+        state.tz = null;
+        state.offFmt = null;
+        state.nameFmt = null;
+      }
     }
 
-    DateTimeFormat.prototype = RealDateTimeFormat.prototype;
-    DateTimeFormat.supportedLocalesOf = markAsNative(
-        (...args) => RealDateTimeFormat.supportedLocalesOf(...args),
-        'supportedLocalesOf',
-    );
-    markAsNative(DateTimeFormat, 'DateTimeFormat');
-    Intl.DateTimeFormat = DateTimeFormat;
-
-    /* ================================================================== *
-     * Date
-     * ================================================================== */
-
-    // The unpatched methods, saved so our replacements can call through.
-    const {
-        getTime, setTime,
-        getDate, getDay, getFullYear, getHours, getMilliseconds, getMinutes,
-        getMonth, getSeconds, getYear,
-        toDateString, toLocaleString, toString, toTimeString,
-        toLocaleTimeString, toLocaleDateString, toISOString,
-        setYear, setHours, setFullYear, setMilliseconds, setMinutes, setMonth,
-        setSeconds, setDate,
-        setUTCDate, setUTCFullYear, setUTCHours, setUTCMilliseconds,
-        setUTCMinutes, setUTCMonth, setUTCSeconds,
-    } = RealDate.prototype;
-
-    /*
-     * Each fake Date keeps a hidden partner date, slid forward or back so that
-     * reading it with the machine's real clock yields the fake zone's wall
-     * clock. All the "local time" getters read from the partner; everything
-     * absolute (getTime, toISOString) reads from the real one.
-     *
-     * The partner lives in a WeakMap rather than on the object, because an own
-     * property would show up in Object.keys() and give the game away.
-     */
-    const localViews = new WeakMap();
-
-    const localViewOf = date => {
-        let view = localViews.get(date);
-        if (view === undefined) {
-            const timestamp = getTime.call(date);
-            view = new RealDate(Number.isFinite(timestamp) ? timestamp + clockShiftAt(timestamp) : NaN);
-            localViews.set(date, view);
-        }
-        return view;
-    };
-
-    /** Re-slide the partner after the real timestamp has been changed. */
-    const refreshLocalView = date => {
-        const timestamp = getTime.call(date);
-        const view = localViewOf(date);
-        setTime.call(view, Number.isFinite(timestamp) ? timestamp + clockShiftAt(timestamp) : NaN);
-    };
-
-    /*
-     * Inputs written without a zone - new Date(2026, 0, 1) or
-     * new Date("2026-07-04T09:15") - are defined as LOCAL time. The engine
-     * reads them in the machine's real zone, which is the wrong answer for us.
-     * We work backwards to find the real timestamp whose FAKE wall clock is
-     * what was actually written.
-     */
-    const ISO_DATE_WITHOUT_TIME = /^\d{4}(-\d{2}(-\d{2})?)?$/;
-    const ENDS_WITH_EXPLICIT_ZONE = /(?:[zZ]|[+-]\d{2}:?\d{2})$/;
-
-    const stringMeansLocalTime = value => {
-        const text = String(value).trim();
-        if (!text) {
-            return false;
-        }
-        // Date-only ISO strings are defined as UTC, not local.
-        if (ISO_DATE_WITHOUT_TIME.test(text)) {
-            return false;
-        }
-        // Anything carrying its own zone already has an unambiguous answer.
-        if (ENDS_WITH_EXPLICIT_ZONE.test(text)) {
-            return false;
-        }
-        return !/\b(?:GMT|UTC|[A-Z]{3,5}T)\b/.test(text);
-    };
-
-    const argumentsMeanLocalTime = args => {
-        if (args.length >= 2) {
-            return true;
-        }
-        return args.length === 1 && typeof args[0] === 'string' && stringMeansLocalTime(args[0]);
-    };
-
-    const reinterpretAsFakeLocalTime = timestamp => {
-        if (!Number.isFinite(timestamp)) {
-            return timestamp;
-        }
-        // We want the real timestamp R where R + clockShiftAt(R) === timestamp.
-        // One refinement pass settles the answer around DST boundaries.
-        const firstGuess = timestamp - clockShiftAt(timestamp);
-        return timestamp - clockShiftAt(firstGuess);
-    };
-
-    /* -------------------------------- rewriting Date.toString() output --- */
-
-    const padToTwoDigits = value => (value < 10 ? '0' : '') + value;
-
-    /** Turns +240 into "-0400", matching what Date.toString() prints. */
-    const formatGmtOffset = offsetMinutes => {
-        const sign = offsetMinutes <= 0 ? '+' : '-';
-        const absolute = Math.abs(offsetMinutes);
-        return sign + padToTwoDigits((absolute / 60) | 0) + padToTwoDigits(absolute % 60);
-    };
-
-    /*
-     * Date.toString() prints like:
-     *     "Sat Jul 04 2026 13:30:00 GMT+0100 (British Summer Time)"
-     * The partner date supplies the right numbers but the wrong tail, so we
-     * swap the offset and the zone label for the fake zone's versions.
-     */
-    const rewriteZoneInDateString = (text, milliseconds) => {
-        if (typeof text !== 'string' || !Number.isFinite(milliseconds)) {
-            return text;
-        }
-
-        // Matches the "+0100" in "GMT+0100" and in "(GMT+0100)".
-        text = text.replace(/([T(])[+-]\d{4}/g, '$1' + formatGmtOffset(fakeOffsetAt(milliseconds)));
-
-        const labelStart = text.indexOf(' (');
-        if (labelStart !== -1) {
-            text = text.slice(0, labelStart) + ' (' + zoneLabelAt(milliseconds) + ')';
-        }
-        return text;
-    };
-
-    /* ------------------------------------------------ the replacement --- */
-
-    /**
-     * Applies a "local time" setter (setHours, setDate, ...). The change is
-     * made on the partner date, then the same amount of movement is mirrored
-     * onto the real timestamp.
-     */
-    function setViaLocalClock(date, setter, args) {
-        const view = localViewOf(date);
-        const before = getTime.call(view);
-        const after = setter.apply(view, args);
-        setTime.call(date, getTime.call(date) + (after - before));
-        return after;
+    // ---- Offset model ------------------------------------------------------
+    function utcFromFields(y, mo, d, h, mi, s) {
+      apply(N.setTime, scratch, [0]);
+      apply(N.setUTCFullYear, scratch, [y, mo, d]);
+      apply(N.setUTCHours, scratch, [h, mi, s, 0]);
+      return apply(N.getTime, scratch, []);
     }
 
-    /**
-     * Applies a UTC setter (setUTCHours, setTime, ...). Those are absolute, so
-     * they act on the real timestamp and the partner is recomputed.
-     */
-    function setViaUtcClock(date, setter, args) {
-        const result = setter.apply(date, args);
-        refreshLocalView(date);
-        return result;
+    // Offset (local - UTC, in ms) of the target zone at UTC instant t
+    function rawOffset(t) {
+      if (!state.offFmt) return 0;
+      let parts;
+      try {
+        parts = state.offFmt.formatToParts(t);
+      } catch (e) {
+        return 0;
+      }
+      let y = 0, mo = 1, d = 1, h = 0, mi = 0, s = 0, bc = false;
+      for (let i = 0; i < parts.length; i++) {
+        const p = parts[i];
+        switch (p.type) {
+          case 'era': bc = p.value.charAt(0) === 'B'; break;
+          case 'year': y = +p.value; break;
+          case 'month': mo = +p.value; break;
+          case 'day': d = +p.value; break;
+          case 'hour': h = +p.value; break;
+          case 'minute': mi = +p.value; break;
+          case 'second': s = +p.value; break;
+          default: break;
+        }
+      }
+      if (bc) y = 1 - y;
+      if (h === 24) h = 0;
+      const L = utcFromFields(y, mo - 1, d, h, mi, s);
+      const off = L - Math.floor(t / 1000) * 1000;
+      return off === off ? off : 0;
     }
 
-    class FakeZoneDate extends RealDate {
-        constructor(...args) {
-            super(...args);
-            if (argumentsMeanLocalTime(args)) {
-                setTime.call(this, reinterpretAsFakeLocalTime(getTime.call(this)));
-            }
-            localViewOf(this);
-        }
-
-        // --- local-time readers: answered from the partner date ---
-        toLocaleString(...args) { return toLocaleString.apply(localViewOf(this), args); }
-        toLocaleTimeString(...args) { return toLocaleTimeString.apply(localViewOf(this), args); }
-        toLocaleDateString(...args) { return toLocaleDateString.apply(localViewOf(this), args); }
-        toDateString(...args) { return toDateString.apply(localViewOf(this), args); }
-        getDate(...args) { return getDate.apply(localViewOf(this), args); }
-        getDay(...args) { return getDay.apply(localViewOf(this), args); }
-        getFullYear(...args) { return getFullYear.apply(localViewOf(this), args); }
-        getHours(...args) { return getHours.apply(localViewOf(this), args); }
-        getMilliseconds(...args) { return getMilliseconds.apply(localViewOf(this), args); }
-        getMinutes(...args) { return getMinutes.apply(localViewOf(this), args); }
-        getMonth(...args) { return getMonth.apply(localViewOf(this), args); }
-        getSeconds(...args) { return getSeconds.apply(localViewOf(this), args); }
-        getYear(...args) { return getYear.apply(localViewOf(this), args); }
-
-        // --- local-time writers ---
-        setHours(...args) { return setViaLocalClock(this, setHours, args); }
-        setFullYear(...args) { return setViaLocalClock(this, setFullYear, args); }
-        setMilliseconds(...args) { return setViaLocalClock(this, setMilliseconds, args); }
-        setMinutes(...args) { return setViaLocalClock(this, setMinutes, args); }
-        setMonth(...args) { return setViaLocalClock(this, setMonth, args); }
-        setSeconds(...args) { return setViaLocalClock(this, setSeconds, args); }
-        setDate(...args) { return setViaLocalClock(this, setDate, args); }
-        setYear(...args) { return setViaLocalClock(this, setYear, args); }
-
-        // --- absolute writers ---
-        setTime(...args) { return setViaUtcClock(this, setTime, args); }
-        setUTCDate(...args) { return setViaUtcClock(this, setUTCDate, args); }
-        setUTCFullYear(...args) { return setViaUtcClock(this, setUTCFullYear, args); }
-        setUTCHours(...args) { return setViaUtcClock(this, setUTCHours, args); }
-        setUTCMilliseconds(...args) { return setViaUtcClock(this, setUTCMilliseconds, args); }
-        setUTCMinutes(...args) { return setViaUtcClock(this, setUTCMinutes, args); }
-        setUTCMonth(...args) { return setViaUtcClock(this, setUTCMonth, args); }
-        setUTCSeconds(...args) { return setViaUtcClock(this, setUTCSeconds, args); }
-
-        // --- text with a zone in it ---
-        toString(...args) {
-            return rewriteZoneInDateString(toString.apply(localViewOf(this), args), getTime.call(this));
-        }
-        toTimeString(...args) {
-            return rewriteZoneInDateString(toTimeString.apply(localViewOf(this), args), getTime.call(this));
-        }
-
-        /*
-         * Absolute values are deliberately left alone. The instant in time is
-         * genuine - only its local interpretation is faked - so timestamps
-         * sent to a server stay correct and nothing breaks.
-         */
-        toISOString(...args) { return toISOString.apply(this, args); }
-        toJSON() { return toISOString.call(this); }
-        valueOf() { return getTime.call(this); }
-        getTime(...args) { return getTime.apply(this, args); }
-
-        getTimezoneOffset() { return fakeOffsetAt(getTime.call(this)); }
+    // Cached per UTC day: if offset is identical at both ends of the day,
+    // it is constant throughout the day. Otherwise compute rawOffset(t).
+    function offsetAt(t) {
+      if (!(t >= -MAX_TIME && t <= MAX_TIME)) return 0;
+      const b = Math.floor(t / DAY);
+      let v = offsetCache.get(b);
+      if (v === undefined) {
+        const a = rawOffset(b * DAY);
+        const c = rawOffset((b + 1) * DAY);
+        v = a === c ? a : null;
+        if (offsetCache.size >= OFFSET_CACHE_LIMIT) offsetCache.clear();
+        offsetCache.set(b, v);
+      }
+      return v === null ? rawOffset(t) : v;
     }
 
-    FakeZoneDate.now = markAsNative(() => RealDate.now(), 'now');
-    FakeZoneDate.UTC = markAsNative((...args) => RealDate.UTC(...args), 'UTC');
-    FakeZoneDate.parse = markAsNative(function parse(value) {
-        const timestamp = RealDate.parse(value);
-        return typeof value === 'string' && stringMeansLocalTime(value)
-            ? reinterpretAsFakeLocalTime(timestamp)
-            : timestamp;
-    }, 'parse');
+    // Local wall-clock (in ms) -> real UTC instant following ECMA-262
+    function localToUTC(L) {
+      if (L !== L) return NaN;
+      const e = offsetAt(L - DAY);
+      const l = offsetAt(L + DAY);
+      if (e === l) return L - e;
+      const tA = L - e;
+      const tB = L - l;
+      if (tA + offsetAt(tA) === L) return tA;
+      if (tB + offsetAt(tB) === L) return tB;
+      return tA;
+    }
 
-    // Real dates made before we loaded should still pass `x instanceof Date`.
-    Object.defineProperty(FakeZoneDate, Symbol.hasInstance, {
-        value: value => value instanceof RealDate,
-        configurable: true,
+    function loadLocal(t) {
+      apply(N.setTime, scratch, [t + offsetAt(t)]);
+      return scratch;
+    }
+
+    // ---- String formatting helpers -----------------------------------------
+    const DAYS = ['Sun', 'Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat'];
+    const MONTHS = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec'];
+    const pad = (n, w) => {
+      let s = String(n);
+      while (s.length < w) s = '0' + s;
+      return s;
+    };
+
+    function datePart(sc) {
+      const y = apply(N.getUTCFullYear, sc, []);
+      return DAYS[apply(N.getUTCDay, sc, [])] + ' ' + MONTHS[apply(N.getUTCMonth, sc, [])] + ' ' +
+        pad(apply(N.getUTCDate, sc, []), 2) + ' ' + (y < 0 ? '-' : '') + pad(Math.abs(y), 4);
+    }
+
+    function intlZoneName(t) {
+      if (!state.nameFmt) return '';
+      try {
+        const parts = state.nameFmt.formatToParts(t);
+        for (let i = 0; i < parts.length; i++) {
+          if (parts[i].type === 'timeZoneName') return parts[i].value;
+        }
+      } catch (e) { /* ignore */ }
+      return '';
+    }
+
+    // V8 EquivalentYear emulation for dates outside 1970..2038
+    function equivalentTime(t) {
+      if (t >= 0 && t <= 2147483647000) return t;
+      const sc = new NativeDate(t);
+      const y = apply(N.getUTCFullYear, sc, []);
+      const m = apply(N.getUTCMonth, sc, []);
+      const d = apply(N.getUTCDate, sc, []);
+      const withinDay = t - Math.floor(t / DAY) * DAY;
+      apply(N.setTime, scratch, [0]);
+      apply(N.setUTCFullYear, scratch, [y, 0, 1]);
+      const weekday = apply(N.getUTCDay, scratch, []);
+      const leap = (y % 4 === 0 && y % 100 !== 0) || y % 400 === 0;
+      const recent = (leap ? 1956 : 1967) + ((weekday * 12) % 28);
+      const eq = 2008 + ((recent + 3 * 28 - 2008) % 28);
+      apply(N.setTime, scratch, [0]);
+      apply(N.setUTCFullYear, scratch, [eq, m, d]);
+      return apply(N.getTime, scratch, []) + withinDay;
+    }
+
+    const REF_JAN = 1579046400000; // 2020-01-15
+    const REF_JUL = 1594771200000; // 2020-07-15
+    function referenceNames() {
+      if (state.refNames) return state.refNames;
+      const nJan = intlZoneName(REF_JAN);
+      const nJul = intlZoneName(REF_JUL);
+      let lo = Infinity;
+      let hi = -Infinity;
+      for (let m = 0; m < 12; m++) {
+        const o = offsetAt(REF_JAN + m * 30.4375 * DAY);
+        if (o < lo) lo = o;
+        if (o > hi) hi = o;
+      }
+      const names = offsetAt(REF_JAN) > offsetAt(REF_JUL) ? { std: nJul, dst: nJan } : { std: nJan, dst: nJul };
+      names.rawStd = lo;
+      names.saving = hi - lo;
+      state.refNames = names;
+      return names;
+    }
+
+    const BARE_GMT = /^GMT(?:[+-]|$)/;
+    function gmtLabel(off) {
+      if (off === 0) return 'GMT';
+      const m = Math.floor(Math.abs(off) / 60000);
+      return 'GMT' + (off < 0 ? '-' : '+') + pad(Math.floor(m / 60), 2) + ':' + pad(m % 60, 2);
+    }
+
+    function eraStandardOffset(t) {
+      const y = apply(N.getUTCFullYear, new NativeDate(t), []);
+      return Math.min(offsetAt(utcFromFields(y, 0, 1, 0, 0, 0)), offsetAt(utcFromFields(y, 6, 1, 0, 0, 0)));
+    }
+
+    function zoneName(t0) {
+      const t = equivalentTime(t0);
+      const ref = referenceNames();
+
+      if (BARE_GMT.test(ref.std) && BARE_GMT.test(ref.dst)) {
+        return gmtLabel(ref.rawStd + (offsetAt(t) > ref.rawStd ? ref.saving : 0));
+      }
+
+      const name = intlZoneName(t);
+      if (name === ref.std || name === ref.dst) return name;
+
+      const bare = !name || BARE_GMT.test(name);
+      const daylight = bare ? offsetAt(t) > eraStandardOffset(t) : /daylight|summer/i.test(name);
+      if (ref.std !== ref.dst) return daylight ? ref.dst : ref.std;
+      if (!daylight) return ref.std;
+      const word = /daylight/i.test(name) ? 'Daylight' : 'Summer';
+      return ref.std.indexOf('Standard') >= 0 ? ref.std.replace('Standard', word) : (name || ref.std);
+    }
+
+    function timePart(sc, t, off) {
+      const abs = Math.floor(Math.abs(off) / 60000);
+      return pad(apply(N.getUTCHours, sc, []), 2) + ':' + pad(apply(N.getUTCMinutes, sc, []), 2) + ':' +
+        pad(apply(N.getUTCSeconds, sc, []), 2) + ' GMT' + (off < 0 ? '-' : '+') +
+        pad(Math.floor(abs / 60), 2) + pad(abs % 60, 2) + ' (' + zoneName(t) + ')';
+    }
+
+    function fakeToString(t) {
+      if (t !== t) return 'Invalid Date';
+      const off = offsetAt(t);
+      const sc = loadLocal(t);
+      return datePart(sc) + ' ' + timePart(sc, t, off);
+    }
+
+    // ---- Date.prototype: local getters -------------------------------------
+    const fakes = {};
+
+    ['getDate', 'getDay', 'getFullYear', 'getHours', 'getMilliseconds', 'getMinutes', 'getMonth', 'getSeconds']
+      .forEach((name) => {
+        const orig = P[name];
+        const utcFn = N['getUTC' + name.slice(3)];
+        fakes[name] = ({
+          [name]() {
+            if (!state.active) return apply(orig, this, []);
+            const t = apply(N.getTime, this, []);
+            if (t !== t) return NaN;
+            return apply(utcFn, loadLocal(t), []);
+          },
+        })[name];
+      });
+
+    if (P.getYear) {
+      const origGetYear = P.getYear;
+      fakes.getYear = ({
+        getYear() {
+          if (!state.active) return apply(origGetYear, this, []);
+          const t = apply(N.getTime, this, []);
+          if (t !== t) return NaN;
+          return apply(N.getUTCFullYear, loadLocal(t), []) - 1900;
+        },
+      }).getYear;
+    }
+
+    {
+      const orig = P.getTimezoneOffset;
+      fakes.getTimezoneOffset = ({
+        getTimezoneOffset() {
+          if (!state.active) return apply(orig, this, []);
+          const t = apply(N.getTime, this, []);
+          if (t !== t) return NaN;
+          const r = Math.trunc((t - (t + offsetAt(t))) / 60000);
+          return r === 0 ? 0 : r;
+        },
+      }).getTimezoneOffset;
+    }
+
+    // ---- Date.prototype: local setters -------------------------------------
+    const SETTERS = {
+      setDate: 1, setFullYear: 3, setHours: 4, setMilliseconds: 1,
+      setMinutes: 3, setMonth: 2, setSeconds: 2,
+    };
+    Object.keys(SETTERS).forEach((name) => {
+      const orig = P[name];
+      const utcFn = N['setUTC' + name.slice(3)];
+      const lengthOf = SETTERS[name];
+      const fn = ({
+        [name]() {
+          if (!state.active) return apply(orig, this, arguments);
+          const t = apply(N.getTime, this, []);
+          if (t !== t && name !== 'setFullYear') {
+            apply(utcFn, new NativeDate(NaN), arguments);
+            return NaN;
+          }
+          const L = t !== t ? 0 : t + offsetAt(t);
+          const sc = new NativeDate(L);
+          const r = apply(utcFn, sc, arguments);
+          return apply(N.setTime, this, [r !== r ? NaN : localToUTC(r)]);
+        },
+      })[name];
+      defineProperty(fn, 'length', { value: lengthOf, configurable: true });
+      fakes[name] = fn;
     });
 
-    markAsNative(FakeZoneDate, 'Date');
-    for (const methodName of Object.getOwnPropertyNames(FakeZoneDate.prototype)) {
-        if (methodName === 'constructor') {
-            continue;
-        }
-        const descriptor = Object.getOwnPropertyDescriptor(FakeZoneDate.prototype, methodName);
-        if (descriptor && typeof descriptor.value === 'function') {
-            markAsNative(descriptor.value, methodName);
-        }
+    if (P.setYear) {
+      const orig = P.setYear;
+      fakes.setYear = ({
+        setYear(year) {
+          if (!state.active) return apply(orig, this, arguments);
+          const t = apply(N.getTime, this, []);
+          const L = t !== t ? 0 : t + offsetAt(t);
+          const y = +year;
+          if (y !== y) { apply(N.setTime, this, [NaN]); return NaN; }
+          const ty = Math.trunc(y);
+          const yyyy = ty >= 0 && ty <= 99 ? 1900 + ty : ty;
+          const sc = new NativeDate(L);
+          const r = apply(N.setUTCFullYear, sc, [yyyy]);
+          return apply(N.setTime, this, [r !== r ? NaN : localToUTC(r)]);
+        },
+      }).setYear;
     }
 
-    globalThis.Date = FakeZoneDate;
+    // ---- Date.prototype: string conversions --------------------------------
+    {
+      const o = { toString: P.toString, toDateString: P.toDateString, toTimeString: P.toTimeString };
+      fakes.toString = ({
+        toString() {
+          if (!state.active) return apply(o.toString, this, []);
+          return fakeToString(apply(N.getTime, this, []));
+        },
+      }).toString;
+      fakes.toDateString = ({
+        toDateString() {
+          if (!state.active) return apply(o.toDateString, this, []);
+          const t = apply(N.getTime, this, []);
+          return t !== t ? 'Invalid Date' : datePart(loadLocal(t));
+        },
+      }).toDateString;
+      fakes.toTimeString = ({
+        toTimeString() {
+          if (!state.active) return apply(o.toTimeString, this, []);
+          const t = apply(N.getTime, this, []);
+          if (t !== t) return 'Invalid Date';
+          const off = offsetAt(t);
+          return timePart(loadLocal(t), t, off);
+        },
+      }).toTimeString;
+    }
 
-    /* ================================================================== *
-     * Temporal
-     *
-     * Temporal asks the same two questions as Date, through a different door,
-     * and none of the work above covers it:
-     *
-     *   Temporal.Now.timeZoneId()          hands out the zone name outright
-     *   Temporal.Now.plainDateTimeISO()    reads the wall clock
-     *   Temporal.Now.zonedDateTimeISO()    both at once
-     *
-     * Each of those (except timeZoneId) takes an optional zone and falls back
-     * to the system one, so all we have to do is change what "no zone given"
-     * means.
-     *
-     * We answer with the IANA zone NAME rather than a fixed offset. That keeps
-     * Temporal's own timezone database in charge of daylight saving, and keeps
-     * its answers consistent with what Intl.DateTimeFormat reports - the two
-     * disagreeing would be exactly the tell we are trying to avoid.
-     *
-     * The one thing that does not carry across is a hand-edited offset from
-     * Advanced settings: Temporal is told a zone, not an adjustment, so it
-     * reports that zone's real offset.
-     * ================================================================== */
+    function withTZ(options) {
+      if (options === undefined) return { timeZone: state.tz };
+      if (options === null || (typeof options !== 'object' && typeof options !== 'function')) return options;
+      if (options.timeZone !== undefined) return options;
+      const o = Object.create(options);
+      o.timeZone = state.tz;
+      return o;
+    }
 
-    const TemporalNamespace = globalThis.Temporal;
+    const LOCALE_DEFAULTS = {
+      toLocaleString: { year: 'numeric', month: 'numeric', day: 'numeric', hour: 'numeric', minute: 'numeric', second: 'numeric' },
+      toLocaleDateString: { year: 'numeric', month: 'numeric', day: 'numeric' },
+      toLocaleTimeString: { hour: 'numeric', minute: 'numeric', second: 'numeric' },
+    };
+    const localeFormatters = new Map();
+    const LOCALE_CACHE_LIMIT = 64;
 
-    if (TemporalNamespace && typeof TemporalNamespace === 'object') {
-        /** Replaces a method, quietly giving up if the property is locked. */
-        const replaceMethod = (owner, methodName, build) => {
-            const realMethod = owner[methodName];
-            if (typeof realMethod !== 'function') {
-                return;
+    ['toLocaleString', 'toLocaleDateString', 'toLocaleTimeString'].forEach((name) => {
+      const orig = P[name];
+      fakes[name] = ({
+        [name](locales, options) {
+          if (!state.active) return apply(orig, this, arguments);
+          if (options === undefined && (locales === undefined || typeof locales === 'string') && NativeDTF) {
+            const t = apply(N.getTime, this, []);
+            if (t !== t) return 'Invalid Date';
+            const key = name + '|' + (locales === undefined ? '\u0000' : locales);
+            let f = localeFormatters.get(key);
+            if (f === undefined) {
+              f = new NativeDTF(locales, Object.assign({ timeZone: state.tz }, LOCALE_DEFAULTS[name]));
+              if (localeFormatters.size >= LOCALE_CACHE_LIMIT) localeFormatters.clear();
+              localeFormatters.set(key, f);
             }
-            const replacement = build(realMethod);
-            markAsNative(replacement, methodName);
-            try {
-                owner[methodName] = replacement;
+            return f.format(t);
+          }
+          return apply(orig, this, [locales, withTZ(options)]);
+        },
+      })[name];
+    });
+
+    // ---- Date constructor & Date.parse -------------------------------------
+    const RE_DATE_ONLY = /^(?:\d{4}|[+-]\d{6})(?:-\d{2}(?:-\d{2})?)?$/;
+    const RE_ISO_DT = /^(?:\d{4}|[+-]\d{6})-\d{2}-\d{2}T\d{2}:\d{2}(?::\d{2}(?:[.,]\d+)?)?(?:Z|[+-]\d{2}(?::?\d{2})?)?$/i;
+    const RE_ISO_ZONE = /(?:Z|[+-]\d{2}(?::?\d{2})?)$/i;
+    const RE_LEGACY_ZONE = /(?:^|[^a-z])(?:GMT|UTC|UT|Z|[ECMP][SD]T)(?![a-z])|\d:\d{2}(?::\d{2}(?:\.\d+)?)?\s*(?:[ap]\.?m\.?)?\s*[+-]\d{2}:?\d{2}\b/i;
+
+    function parseString(s) {
+      const r = apply(nativeParse, NativeDate, [s]);
+      if (r !== r) return NaN;
+      const x = s.replace(/\([^)]*\)/g, ' ').trim();
+      if (RE_DATE_ONLY.test(x)) return r;
+      if (RE_ISO_DT.test(x)) {
+        if (RE_ISO_ZONE.test(x)) return r;
+        const L = apply(nativeParse, NativeDate, [x + 'Z']);
+        return L !== L ? r : localToUTC(L);
+      }
+      if (RE_LEGACY_ZONE.test(x)) return r;
+      const L = apply(nativeParse, NativeDate, [s + ' GMT']);
+      return L !== L ? r : localToUTC(L);
+    }
+
+    function isObject(v) { return v !== null && (typeof v === 'object' || typeof v === 'function'); }
+
+    function toPrimitiveDefault(v) {
+      if (!isObject(v)) return v;
+      const ex = v[Symbol.toPrimitive];
+      if (ex !== undefined && ex !== null) {
+        const r = apply(ex, v, ['default']);
+        if (isObject(r)) throw new TypeError('Cannot convert object to primitive value');
+        return r;
+      }
+      const names = ['valueOf', 'toString'];
+      for (let i = 0; i < names.length; i++) {
+        const f = v[names[i]];
+        if (typeof f === 'function') {
+          const r = apply(f, v, []);
+          if (!isObject(r)) return r;
+        }
+      }
+      throw new TypeError('Cannot convert object to primitive value');
+    }
+
+    function FakeDate(...args) {
+      if (!new.target) {
+        return state.active ? fakeToString(apply(nativeNow, NativeDate, [])) : apply(NativeDate, undefined, []);
+      }
+      if (!state.active || args.length === 0) return construct(NativeDate, args, new.target);
+      let t;
+      if (args.length === 1) {
+        const v = args[0];
+        let tv;
+        let isDate = false;
+        if (isObject(v)) { try { tv = apply(N.getTime, v, []); isDate = true; } catch (e) { isDate = false; } }
+        if (isDate) {
+          t = tv;
+        } else {
+          const prim = toPrimitiveDefault(v);
+          t = typeof prim === 'string' ? parseString(prim) : +prim;
+        }
+      } else {
+        t = localToUTC(apply(nativeUTC, undefined, args));
+      }
+      return construct(NativeDate, [t], new.target);
+    }
+
+    const fakeParseFn = ({
+      parse(str) {
+        if (!state.active) return apply(nativeParse, NativeDate, [str]);
+        return parseString(`${str}`);
+      },
+    }).parse;
+
+    // ---- Intl.DateTimeFormat (Clean replacement, no Proxy wrapper) ---------
+    let FakeDTF = null;
+    if (NativeDTF) {
+      FakeDTF = function DateTimeFormat(locales, options) {
+        return construct(NativeDTF, [locales, state.active ? withTZ(options) : options], new.target || FakeDTF);
+      };
+      defineProperty(FakeDTF, 'name', { value: 'DateTimeFormat', configurable: true });
+      defineProperty(FakeDTF, 'length', { value: 0, configurable: true });
+      defineProperty(FakeDTF, 'prototype', { value: NativeDTF.prototype, writable: false, enumerable: false, configurable: false });
+      defineProperty(FakeDTF, 'supportedLocalesOf', Object.getOwnPropertyDescriptor(NativeDTF, 'supportedLocalesOf'));
+      register(FakeDTF, 'DateTimeFormat');
+      defineProperty(NativeDTF.prototype, 'constructor', { value: FakeDTF, writable: true, enumerable: false, configurable: true });
+      defineProperty(NativeIntl, 'DateTimeFormat', { value: FakeDTF, writable: true, enumerable: false, configurable: true });
+    }
+
+    // ---- Temporal (if supported by engine) ----------------------------------
+    function patchTemporal() {
+      const Now = root.Temporal && root.Temporal.Now;
+      if (!Now) return;
+      if (typeof Now.timeZoneId === 'function') {
+        const orig = Now.timeZoneId;
+        const f = ({ timeZoneId() { return state.active ? state.tz : apply(orig, this, []); } }).timeZoneId;
+        register(f, 'timeZoneId');
+        defineProperty(Now, 'timeZoneId', { value: f, writable: true, configurable: true, enumerable: false });
+      }
+      ['zonedDateTimeISO', 'plainDateTimeISO', 'plainDateISO', 'plainTimeISO'].forEach((name) => {
+        const orig = Now[name];
+        if (typeof orig !== 'function') return;
+        const f = ({
+          [name](tz) { return apply(orig, this, [tz === undefined && state.active ? state.tz : tz]); },
+        })[name];
+        defineProperty(f, 'length', { value: 0, configurable: true });
+        register(f, name);
+        defineProperty(Now, name, { value: f, writable: true, configurable: true, enumerable: false });
+      });
+    }
+
+    // ---- Install Date prototype patches and register disguises ------------
+    Object.keys(fakes).forEach((name) => {
+      const fn = fakes[name];
+      if (!Object.prototype.hasOwnProperty.call(SETTERS, name) && name !== 'setYear') {
+        const lengths = { toLocaleString: 0, toLocaleDateString: 0, toLocaleTimeString: 0 };
+        defineProperty(fn, 'length', { value: lengths[name] || 0, configurable: true });
+      }
+      if (name === 'setYear') defineProperty(fn, 'length', { value: 1, configurable: true });
+      defineProperty(fn, 'name', { value: name, configurable: true });
+      register(fn, name);
+      defineProperty(P, name, { value: fn, writable: true, configurable: true, enumerable: false });
+    });
+
+    defineProperty(FakeDate, 'name', { value: 'Date', configurable: true });
+    defineProperty(FakeDate, 'length', { value: 7, configurable: true });
+    defineProperty(FakeDate, 'prototype', { value: P, writable: false, enumerable: false, configurable: false });
+    defineProperty(fakeParseFn, 'name', { value: 'parse', configurable: true });
+    defineProperty(fakeParseFn, 'length', { value: 1, configurable: true });
+    register(FakeDate, 'Date');
+    register(fakeParseFn, 'parse');
+    defineProperty(FakeDate, 'now', { value: nativeNow, writable: true, enumerable: false, configurable: true });
+    defineProperty(FakeDate, 'parse', { value: fakeParseFn, writable: true, enumerable: false, configurable: true });
+    defineProperty(FakeDate, 'UTC', { value: nativeUTC, writable: true, enumerable: false, configurable: true });
+    defineProperty(P, 'constructor', { value: FakeDate, writable: true, enumerable: false, configurable: true });
+    defineProperty(root, 'Date', { value: FakeDate, writable: true, enumerable: false, configurable: true });
+
+    try { patchTemporal(); } catch (e) { /* Temporal is optional */ }
+
+    // Transparent Function.prototype.toString disguise
+    const fakeFnToString = new Proxy(OrigFnToString, {
+      apply(target, thisArg, args) {
+        const s = registry.get(thisArg);
+        return s !== undefined ? s : apply(target, thisArg, args);
+      },
+    });
+    register(fakeFnToString, 'toString');
+    defineProperty(FnProto, 'toString', { value: fakeFnToString, writable: true, enumerable: false, configurable: true });
+
+    // ---- Same-Origin dynamic child frames (about:blank, srcdoc) ------------
+    let lastCfg = null;
+    let appliedTs = 0;
+    const children = new Set();
+    const outerSetConfig = setConfig;
+
+    const controllerApi = {
+      setConfig(cfg) {
+        const ts = (cfg && cfg.ts) || 0;
+        if (ts < appliedTs) return;
+        appliedTs = ts;
+        lastCfg = cfg;
+        outerSetConfig(cfg);
+
+        // Report status through DOM attribute channel if requested
+        if (cfg && cfg.statusChannel && typeof document !== 'undefined') {
+          try {
+            const rootEl = document.documentElement;
+            if (rootEl) {
+              rootEl.setAttribute(cfg.statusChannel, cfg.enabled ? 'masked' : 'off');
             }
-            catch (e) {
-                // Non-writable in this engine; leave the original in place.
-            }
+          } catch (e) { /* ignore */ }
+        }
+
+        // Propagate to all adopted child frames
+        for (const ref of Array.from(children)) {
+          const c = ref.deref();
+          if (c) {
+            try { c.setConfig(cfg); } catch (e) { /* frame gone */ }
+          } else {
+            children.delete(ref);
+          }
+        }
+      },
+      getConfig() {
+        return lastCfg;
+      },
+    };
+
+    function adopt(win) {
+      try {
+        if (!win || win === root) return;
+        if (typeof win.Date !== 'function') return;
+
+        // Never touch Cloudflare Turnstile or challenge platform verification frames
+        try {
+          const loc = win.location;
+          const href = (loc && loc.href) || '';
+          if (href && (href.includes('challenges.cloudflare.com') || href.includes('/cdn-cgi/challenge-platform/'))) {
+            return;
+          }
+        } catch (e) { /* cross-origin check can throw; safe to continue */ }
+
+        const known = win[FRAME_MARK];
+        if (known) {
+          if (!children.has(known.ref)) {
+            known.ref = new WeakRef(known);
+            children.add(known.ref);
+          }
+          if (lastCfg && known.lastApplied !== lastCfg) {
+            known.lastApplied = lastCfg;
+            known.setConfig(lastCfg);
+          }
+          return;
+        }
+        const child = install(win);
+        defineProperty(win, FRAME_MARK, { value: child, enumerable: false });
+        children.add(new WeakRef(child));
+        if (lastCfg) child.setConfig(lastCfg);
+      } catch (e) { /* cross-origin or detached */ }
+    }
+
+    const IFrame = root.HTMLIFrameElement && root.HTMLIFrameElement.prototype;
+    if (IFrame) {
+      for (const prop of ['contentWindow', 'contentDocument']) {
+        const desc = Object.getOwnPropertyDescriptor(IFrame, prop);
+        if (!desc || !desc.get) continue;
+        const nativeGet = desc.get;
+        const getter = {
+          get [prop]() {
+            const v = apply(nativeGet, this, []);
+            adopt(prop === 'contentWindow' ? v : v && v.defaultView);
+            return v;
+          },
         };
-
-        const TemporalNow = TemporalNamespace.Now;
-
-        if (TemporalNow && typeof TemporalNow === 'object') {
-            // These all read "now" in a zone, defaulting to the system zone.
-            for (const methodName of [
-                'zonedDateTimeISO', 'plainDateTimeISO', 'plainDateISO', 'plainTimeISO',
-            ]) {
-                replaceMethod(TemporalNow, methodName, realMethod =>
-                    function (timeZone, ...rest) {
-                        return realMethod.call(
-                            TemporalNow,
-                            timeZone === undefined ? timezoneName : timeZone,
-                            ...rest,
-                        );
-                    });
-            }
-
-            // The blunt one: it just returns the system zone's name.
-            replaceMethod(TemporalNow, 'timeZoneId', () => function timeZoneId() {
-                return timezoneName;
-            });
-
-            /*
-             * Temporal.Now.instant() is deliberately untouched, for the same
-             * reason Date.now() is: it names a moment, not a local reading of
-             * one, so it is not ours to lie about.
-             */
-        }
-
-        /*
-         * An Instant is absolute, but rendering one for a human has to pick a
-         * zone, and toLocaleString() picks the system's. Same substitution.
-         *
-         * Instant.prototype.toString() is left alone on purpose: it defaults
-         * to UTC, not to the system zone, so it gives nothing away.
-         */
-        const Instant = TemporalNamespace.Instant;
-
-        if (Instant && Instant.prototype) {
-            replaceMethod(Instant.prototype, 'toLocaleString', realMethod =>
-                function toLocaleString(locales, options) {
-                    const withZone = { ...(options && typeof options === 'object' ? options : {}) };
-                    if (withZone.timeZone === undefined) {
-                        withZone.timeZone = timezoneName;
-                    }
-                    return realMethod.call(this, locales, withZone);
-                });
-        }
+        const fn = Object.getOwnPropertyDescriptor(getter, prop).get;
+        register(fn, 'get ' + prop);
+        defineProperty(IFrame, prop, { get: fn, set: undefined, enumerable: desc.enumerable, configurable: true });
+      }
     }
 
-    /* ================================================================== *
-     * Web Workers
-     *
-     * A worker is a fresh JavaScript context with its own untouched Date, so
-     * without this a page could just do:
-     *
-     *     new Worker(url)  ->  worker posts back new Date().getTimezoneOffset()
-     *
-     * ...and read the machine's real timezone straight through the patch.
-     *
-     * We can't reach inside a worker after it starts, so we replace the script
-     * it boots from: a small generated script that installs this hook first,
-     * then loads the page's real worker code.
-     *
-     * The replacement has to be a blob: URL, and that is not free. On a site
-     * whose policy forbids blob: workers it does not fail quietly - the worker
-     * constructs, dies a moment later, and whatever it was running is gone from
-     * the page. So the rule we go by is: do nothing at the URL layer that the
-     * site has not already committed to itself.
-     *
-     *   inline worker      new Worker(URL.createObjectURL(blob)), or a data:
-     *                      URL. The site just minted one, so blob: workers
-     *                      plainly run here. Always rewritten.
-     *
-     *   URL worker         new Worker('/w.js'). Rewriting is our idea, not the
-     *                      site's, so it waits on a probe that says blob:
-     *                      workers are allowed - and where they are not, the
-     *                      worker is passed through untouched.
-     *
-     * A worker we passed through sees the real timezone. That is worth saying
-     * out loud in the popup, and it is NOT the same thing as the page itself
-     * leaking, so it does not turn the toolbar dot red.
-     * ================================================================== */
+    return controllerApi;
+  }
 
-    /* ------------------------------------------------------------------ *
-     * Repairing relative URLs inside a worker we booted
-     *
-     * We start workers from a generated blob: script, which means the worker's
-     * own `location` is that blob rather than the script the page asked for.
-     * Anything the worker resolves relatively - importScripts('./chunk.js'),
-     * fetch('./data.json'), a nested worker - would resolve against the blob
-     * and fail.
-     *
-     * So whenever we are running inside a worker we started, we point those
-     * APIs back at the real script URL. This only applies there; in a normal
-     * page `inheritedBaseUrl` is undefined and none of it runs.
-     * ------------------------------------------------------------------ */
+  // ---- Node export (for differential / unit testing) -----------------------
+  if (typeof module === 'object' && module && module.exports) {
+    module.exports = { install };
+    return;
+  }
 
-    if (inheritedBaseUrl) {
-        const resolveFromRealScript = value => {
-            try {
-                return new URL(String(value), inheritedBaseUrl).href;
-            }
-            catch (e) {
-                return value;
-            }
-        };
+  // ---- Browser: Receive configuration from content-script.js (Bridge) ------
+  const existing = window[FRAME_MARK];
+  const controller = existing || install(window);
+  if (!existing) {
+    Object.defineProperty(window, FRAME_MARK, { value: controller, enumerable: false });
+  }
 
-        if (typeof globalThis.importScripts === 'function') {
-            const realImportScripts = globalThis.importScripts;
-            globalThis.importScripts = markAsNative(
-                (...urls) => realImportScripts.apply(globalThis, urls.map(resolveFromRealScript)),
-                'importScripts',
-            );
-        }
+  window.addEventListener(EVT_CFG, function (e) {
+    try {
+      const cfg = typeof e.detail === 'string' ? JSON.parse(e.detail) : e.detail;
+      controller.setConfig(cfg);
+      window.dispatchEvent(new CustomEvent(EVT_ACK, { detail: { active: !!cfg.enabled } }));
+    } catch (err) { /* ignore malformed events */ }
+  }, true);
 
-        if (typeof globalThis.fetch === 'function') {
-            const realFetch = globalThis.fetch;
-            globalThis.fetch = markAsNative(
-                (input, init) => realFetch.call(
-                    globalThis,
-                    typeof input === 'string' ? resolveFromRealScript(input) : input,
-                    init,
-                ),
-                'fetch',
-            );
-        }
-
-        if (typeof globalThis.XMLHttpRequest === 'function') {
-            const realOpen = globalThis.XMLHttpRequest.prototype.open;
-            globalThis.XMLHttpRequest.prototype.open = markAsNative(
-                function open(method, url, ...rest) {
-                    return realOpen.call(this, method, resolveFromRealScript(url), ...rest);
-                },
-                'open',
-            );
-        }
-
-        // Code that works out its own base path from location.href - a common
-        // trick for locating a .wasm file - should see the real script URL too.
-        try {
-            const realScriptLocation = new URL(inheritedBaseUrl);
-            Object.defineProperty(globalThis, 'location', {
-                configurable: true,
-                get: () => realScriptLocation,
-            });
-        }
-        catch (e) {
-            // Not redefinable here; the API patches above still cover most uses.
-        }
-    }
-
-    const canCreateBlobUrls = typeof globalThis.Blob === 'function'
-        && typeof URL !== 'undefined' && typeof URL.createObjectURL === 'function';
-
-    // Captured before the shim below goes on, so our own blob URLs neither go
-    // through it nor end up tracked.
-    const realCreateObjectURL = canCreateBlobUrls ? URL.createObjectURL.bind(URL) : null;
-    const realRevokeObjectURL = canCreateBlobUrls ? URL.revokeObjectURL.bind(URL) : null;
-
-    /* ------------------------------------------------------------------ *
-     * Holding on to the page's own worker blobs
-     *
-     * When a page builds a worker inline - new Worker(URL.createObjectURL(blob))
-     * - the only way to get in front of its code is to read that code. Every
-     * route that reads a blob: URL at runtime goes through the network layer:
-     * fetch and XHR are governed by connect-src, importScripts and <script src>
-     * by script-src. A strict policy commonly allows blob: under worker-src and
-     * nowhere else, so all of them are refused.
-     *
-     * The one thing no directive governs is holding the Blob object itself. So
-     * we shim URL.createObjectURL, keep the Blob it was handed, and later build
-     * `new Blob([prelude, thatBlob])` - concatenation in memory, no request, no
-     * directive to violate.
-     *
-     * The reference is weak and dropped on revokeObjectURL, so this never keeps
-     * a page's blobs alive past their welcome.
-     * ------------------------------------------------------------------ */
-
-    const trackedBlobs = new Map();
-
-    /*
-     * A page is under no obligation to revoke the URLs it mints, and some churn
-     * through thousands of them - image previews, downloads, video segments. The
-     * Blob references are weak, so those pages are not held in memory by us, but
-     * the map entries themselves would pile up. So once the map is big enough to
-     * notice, drop every entry whose Blob has already been collected.
-     */
-    const TRACKED_BLOB_LIMIT = 256;
-
-    const pruneTrackedBlobs = () => {
-        for (const [url, reference] of trackedBlobs) {
-            if (!reference.deref()) {
-                trackedBlobs.delete(url);
-            }
-        }
-
-        // Everything is still live: this page is genuinely holding that many
-        // blobs at once. Forget the oldest rather than grow without limit - a
-        // worker built from one of those would run unpatched, which is the same
-        // outcome as any other blob we cannot read.
-        while (trackedBlobs.size > TRACKED_BLOB_LIMIT) {
-            trackedBlobs.delete(trackedBlobs.keys().next().value);
-        }
-    };
-
-    if (canCreateBlobUrls) {
-        const WeakReference = typeof WeakRef === 'function' ? WeakRef : null;
-
-        URL.createObjectURL = markAsNative(object => {
-            const url = realCreateObjectURL(object);
-            try {
-                if (object instanceof Blob) {
-                    if (trackedBlobs.size >= TRACKED_BLOB_LIMIT) {
-                        pruneTrackedBlobs();
-                    }
-                    trackedBlobs.set(url, WeakReference
-                        ? new WeakReference(object)
-                        : { deref: () => object });
-                }
-            }
-            catch (e) {
-                // instanceof can throw across realms; not worth tracking then.
-            }
-            return url;
-        }, 'createObjectURL');
-
-        URL.revokeObjectURL = markAsNative(url => {
-            trackedBlobs.delete(url);
-            return realRevokeObjectURL(url);
-        }, 'revokeObjectURL');
-    }
-
-    /** The Blob a blob: URL was minted from, if we still have it. */
-    const trackedBlobFor = url => {
-        const reference = trackedBlobs.get(url);
-        if (!reference) {
-            return null;
-        }
-        const blob = reference.deref();
-        if (!blob) {
-            trackedBlobs.delete(url);
-            return null;
-        }
-        return blob;
-    };
-
-    /** The source text of a data: URL, or null if it will not decode. */
-    const decodeDataUrl = url => {
-        const comma = url.indexOf(',');
-        if (comma === -1) {
-            return null;
-        }
-        const meta = url.slice(5, comma);
-        const body = url.slice(comma + 1);
-        try {
-            return meta.includes(';base64') ? atob(body) : decodeURIComponent(body);
-        }
-        catch (e) {
-            return null;
-        }
-    };
-
-    /*
-     * Can we run a blob: worker on this page?
-     *
-     * Only asked about workers the page started from an ordinary URL, where
-     * rewriting to a blob: is a change the site never asked for. Plenty of
-     * sites set a Content-Security-Policy that forbids them, and a blocked
-     * worker does NOT throw - it constructs happily and then fires an error
-     * event a moment later, far too late for us to quietly hand back an
-     * unmodified worker instead. Rewriting optimistically would take the
-     * feature that worker was running off the page entirely.
-     *
-     * So we settle the question once with a throwaway worker, and leave
-     * URL-based workers alone until it comes back.
-     */
-    let blobWorkersAllowed = false;
-
-    const probeBlobWorkerSupport = RealWorkerConstructor => {
-        let probeUrl = null;
-        try {
-            probeUrl = realCreateObjectURL(new Blob(['self.postMessage(0);'], { type: 'text/javascript' }));
-            const probe = new RealWorkerConstructor(probeUrl);
-
-            const finish = allowed => {
-                blobWorkersAllowed = allowed;
-                try {
-                    probe.terminate();
-                }
-                catch (e) {
-                    // Already gone.
-                }
-                realRevokeObjectURL(probeUrl);
-            };
-
-            probe.onmessage = () => finish(true);
-            probe.onerror = () => finish(false);
-        }
-        catch (e) {
-            if (probeUrl) {
-                realRevokeObjectURL(probeUrl);
-            }
-        }
-    };
-
-    /**
-     * The code that boots a worker: install this hook, then load the script the
-     * page actually asked for.
-     *
-     * The worker is told to resolve its own relative URLs against the script it
-     * is really running, so a worker that starts another worker still works.
-     */
-    const workerPreludeFor = realScriptUrl => {
-        const workerSettings = [
-            timezoneName, chosenOffsetMinutes, settings[2], fallbackZoneLabel,
-            realScriptUrl, statusChannel,
-        ];
-        return '(' + hookSource + ')(' + JSON.stringify(workerSettings) + ');\n';
-    };
-
-    /*
-     * Resolve a worker script URL against the right base.
-     *
-     * This matters even when we are not rewriting the worker: inside a worker
-     * we booted from a blob, a relative path like "worker.js" would otherwise
-     * be resolved against the blob URL and simply fail.
-     */
-    const resolveWorkerUrl = scriptUrl => {
-        try {
-            return new URL(String(scriptUrl), baseUrlForWorkers).href;
-        }
-        catch (e) {
-            return scriptUrl;
-        }
-    };
-
-    /**
-     * A worker the page built inline, with our prelude in front of its code.
-     *
-     * Safe on every site, whatever its policy: the page has just minted a
-     * blob: or data: URL and handed it to a worker, so blob: workers are
-     * demonstrably allowed here. Our replacement is a blob: URL on the same
-     * origin, and lands inside the same allowance.
-     *
-     * The prelude inherits no base URL. An inline worker's own `location` was
-     * already a blob: or data: URL that its relative paths could not resolve
-     * against, and it is one afterwards too, so nothing about the worker's view
-     * of itself changes.
-     */
-    const startInlineWorker = (RealWorkerConstructor, scriptUrl, urlText, options, isModule) => {
-        /*
-         * A module worker resolves its imports against its own URL, and ours is
-         * a different blob. Leave it be - bundlers ship module workers from
-         * ordinary URLs anyway, which take the other path.
-         */
-        if (isModule || !canCreateBlobUrls) {
-            reportStatus('worker');
-            return new RealWorkerConstructor(scriptUrl, options);
-        }
-
-        let generatedUrl = null;
-        try {
-            const prelude = workerPreludeFor(null);
-
-            if (urlText.startsWith('blob:')) {
-                const original = trackedBlobFor(urlText);
-                if (original) {
-                    generatedUrl = realCreateObjectURL(
-                        new Blob([prelude, original], { type: 'text/javascript' }),
-                    );
-                }
-            }
-            else {
-                const source = decodeDataUrl(urlText);
-                if (source !== null) {
-                    generatedUrl = realCreateObjectURL(
-                        new Blob([prelude + source], { type: 'text/javascript' }),
-                    );
-                }
-            }
-
-            if (generatedUrl === null) {
-                /*
-                 * The URL was minted before we were installed, or has already
-                 * been revoked, or the data: URL would not decode. There is
-                 * nothing to read, so the worker runs as the page wrote it.
-                 */
-                reportStatus('worker');
-                return new RealWorkerConstructor(scriptUrl, options);
-            }
-
-            const worker = new RealWorkerConstructor(generatedUrl, options);
-
-            // The blob has to outlive construction while the worker fetches
-            // it; a generous delay is safer than revoking immediately.
-            setTimeout(() => realRevokeObjectURL(generatedUrl), 60000);
-            return worker;
-        }
-        catch (e) {
-            if (generatedUrl) {
-                realRevokeObjectURL(generatedUrl);
-            }
-            reportStatus('worker');
-            return new RealWorkerConstructor(scriptUrl, options);
-        }
-    };
-
-    /**
-     * A worker the page started from an ordinary URL.
-     *
-     * Here the blob: rewrite is a change the site never asked for, and it costs
-     * something even where it is allowed: the worker's `location` becomes the
-     * blob rather than its own script. We repair that below, but the repair is
-     * ours to get wrong, so this only happens once the probe says blob: workers
-     * run on this site at all. Everywhere else the worker is passed through
-     * untouched - it sees the real timezone, and the page keeps working.
-     */
-    const startUrlWorker = (RealWorkerConstructor, urlText, options, isModule) => {
-        const realScriptUrl = resolveWorkerUrl(urlText);
-
-        if (!blobWorkersAllowed || !canCreateBlobUrls) {
-            reportStatus('worker');
-            return new RealWorkerConstructor(realScriptUrl, options);
-        }
-
-        let generatedUrl = null;
-        try {
-            // Module workers have no importScripts(), so they use import().
-            const bootstrap = workerPreludeFor(realScriptUrl) + (isModule
-                ? `import(${JSON.stringify(realScriptUrl)});`
-                : `importScripts(${JSON.stringify(realScriptUrl)});`);
-
-            generatedUrl = realCreateObjectURL(new Blob([bootstrap], { type: 'text/javascript' }));
-
-            const worker = new RealWorkerConstructor(generatedUrl, options);
-
-            setTimeout(() => realRevokeObjectURL(generatedUrl), 60000);
-            return worker;
-        }
-        catch (e) {
-            if (generatedUrl) {
-                realRevokeObjectURL(generatedUrl);
-            }
-            reportStatus('worker');
-            return new RealWorkerConstructor(realScriptUrl, options);
-        }
-    };
-
-    const patchWorkerConstructor = (RealWorkerConstructor, constructorName) => {
-        function PatchedWorker(scriptUrl, options) {
-            let urlText;
-            try {
-                urlText = scriptUrl instanceof URL ? scriptUrl.href : String(scriptUrl);
-            }
-            catch (e) {
-                // A Symbol, or an object whose toString throws. Not ours to
-                // fix: hand it to the real constructor and let it complain.
-                return new RealWorkerConstructor(scriptUrl, options);
-            }
-
-            const isModule = !!options && typeof options === 'object' && options.type === 'module';
-
-            /*
-             * Which of the two paths a worker takes turns entirely on whether
-             * the page chose an inline URL itself. Anything it did choose we
-             * can safely rewrite; anything it did not, we mostly leave alone.
-             */
-            if (urlText.startsWith('blob:') || urlText.startsWith('data:')) {
-                return startInlineWorker(
-                    RealWorkerConstructor, scriptUrl, urlText, options, isModule,
-                );
-            }
-
-            return startUrlWorker(RealWorkerConstructor, urlText, options, isModule);
-        }
-
-        PatchedWorker.prototype = RealWorkerConstructor.prototype;
-        Object.defineProperty(PatchedWorker, Symbol.hasInstance, {
-            value: value => value instanceof RealWorkerConstructor,
-            configurable: true,
-        });
-        markAsNative(PatchedWorker, constructorName);
-        return PatchedWorker;
-    };
-
-    /*
-     * Dedicated workers can spawn their own workers, and this hook runs inside
-     * those too - so the patch follows the page down every level of nesting.
-     */
-    if (canCreateBlobUrls && typeof globalThis.Worker === 'function') {
-        // The same CSP directive governs both kinds of worker, so one probe
-        // answers for both.
-        probeBlobWorkerSupport(globalThis.Worker);
-
-        globalThis.Worker = patchWorkerConstructor(globalThis.Worker, 'Worker');
-
-        if (typeof globalThis.SharedWorker === 'function') {
-            globalThis.SharedWorker = patchWorkerConstructor(globalThis.SharedWorker, 'SharedWorker');
-        }
-    }
-
-    // Everything above is in place. Anything that goes wrong from here on is
-    // reported separately, and overrides this.
-    reportStatus('masked');
-};
+  // Request initial configuration in case Bridge is already running
+  try {
+    window.dispatchEvent(new CustomEvent(EVT_REQ));
+  } catch (e) { /* ignore */ }
+})();

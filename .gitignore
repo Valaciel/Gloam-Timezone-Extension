@@ -1,5 +1,7 @@
-# Build output and packaged releases
+# Build output, local backups, and docs
 Backup/
+docs/
+example/
 *.zip
 *.crx
 *.pem
@@ -34,3 +36,6 @@ $RECYCLE.BIN/
 npm-debug.log*
 .env
 .env.local
+
+example/
+example/*

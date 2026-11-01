@@ -1,390 +1,242 @@
-/* globals siteRules, installTimezoneHook */
+/* globals siteRules */
 'use strict';
 
 /*
- * Content script - the fallback path.
- * ===================================
+ * Gloam Timezone Extension — data/content-script.js (Bridge)
+ * =========================================================
  *
- * Runs in every frame at document_start, in the extension's isolated world.
- * Its job is to get the hook into the page's own world.
+ * Runs in every frame at document_start in the extension's ISOLATED world.
  *
- * This is the SECOND choice. When "Allow user scripts" is enabled, the
- * background registers the hook to run before any page code at all (see
- * js/early-injection.js) and this script finds the work already done - the
- * hook's own guard makes the second attempt a no-op.
- *
- * We keep this path because that toggle is off by default, and covering a page
- * a moment late is much better than not covering it.
- *
- * The unavoidable weakness: reading settings from storage is asynchronous, so
- * a page whose first inline script reads the clock immediately can beat us to
- * it. That gap is exactly what early injection exists to close.
+ * Responsibilities:
+ *   1. Reads configuration from extension storage and evaluates site rules
+ *      (Allowlist / Blocklist / Listed mode) for the current frame hostname.
+ *   2. Bridges the verified configuration into the MAIN world's timezone-hook
+ *      via custom window events (__gloam_tz_cfg and __gloam_tz_req).
+ *   3. Watches for Cloudflare and bot challenges: temporarily steps aside so
+ *      bot checks pass cleanly without endless loops, then restores the mask.
+ *   4. Listens to storage changes to propagate popup edits live to all open
+ *      tabs and frames without requiring a page reload.
+ *   5. Reports accurate status to the background worker for the toolbar dot.
  */
 
-const SETTING_KEYS = [
-    'timezone', 'offset', 'naturalOffset', 'zoneLabels',
-    'enabled', 'randomPerTab',
-    'siteMode', 'allowlist', 'blocklist',
-    'statusChannel', 'challengeExemptions',
-];
+(function () {
+    const EVT_CFG = '__gloam_tz_cfg';
+    const EVT_REQ = '__gloam_tz_req';
 
-/*
- * Telltales of an interstitial bot check.
- *
- * The first is the reliable one - it is in the initial HTML of every Cloudflare
- * challenge - and the rest are the wrappers those pages put their widget in.
- * Being wrong in either direction costs at most one reload, so this errs
- * towards recognising a challenge rather than missing one.
- */
-const CHALLENGE_MARKERS = [
-    'script[src*="/cdn-cgi/challenge-platform/"]',
-    '#challenge-form',
-    '#challenge-running',
-    '#cf-challenge-running',
-    'iframe[src*="challenges.cloudflare.com"]',
-];
-
-/** How long to let a challenge render before deciding it is not there. */
-const CHALLENGE_SETTLE_MS = 2000;
-
-function looksLikeChallenge() {
-    return CHALLENGE_MARKERS.some(selector => {
-        try {
-            return document.querySelector(selector) !== null;
-        }
-        catch (e) {
-            return false;
-        }
-    });
-}
-
-function tellBackground(request) {
-    try {
-        chrome.runtime.sendMessage({ request }, () => {
-            void chrome.runtime.lastError;
-        });
-    }
-    catch (e) {
-        // Extension context torn down mid-navigation.
-    }
-}
-
-/**
- * Takes the mask off for a bot check, and puts it back the moment the check is
- * over.
- *
- * Top frame only: a challenge is a property of the page, not of some iframe
- * inside it, and the top frame's host is the only one we would be exempting.
- *
- * Only the first direction reloads. Putting the mask back must NOT, for two
- * reasons that both came out of real use:
- *
- *   - Noticing "the challenge is gone" by looking at the page that replaced it
- *     means the real site has already loaded, and run its scripts, unmasked.
- *     Reloading afterwards does not take that back. So the exemption is dropped
- *     when the CHALLENGE PAGE LEAVES, before the next document exists, and the
- *     next document is masked from its first line with no reload at all.
- *   - A challenge is often cleared by a POST, and reloading a page reached that
- *     way makes the browser ask the user to resubmit the form - which, if they
- *     say yes, submits it again for real.
- */
-function watchForChallenge(isExempt) {
-    if (window.top !== window) {
-        return;
-    }
-
-    if (isExempt) {
-        // This document is the bot check, running bare. When it goes away the
-        // check is over, and that is the last moment we can act before the
-        // next document starts.
-        window.addEventListener(
-            'pagehide',
-            () => tellBackground('ChallengeCleared'),
-            { once: true },
-        );
-    }
-
-    const decide = () => {
-        const onChallenge = looksLikeChallenge();
-
-        if (onChallenge && !isExempt) {
-            tellBackground('ChallengeSeen');
-            return;
-        }
-
-        if (!onChallenge && isExempt) {
-            /*
-             * Safety net. We are exempt, but this is not a challenge - so the
-             * check cleared without this document ever unloading, and the real
-             * site is on screen with the mask off. Drop the exemption so the
-             * next page is covered, and say plainly that this one was not.
-             */
-            tellBackground('ChallengeCleared');
-            sendStatus('leaked', 'challenge');
-        }
-    };
-
-    const start = () => setTimeout(decide, CHALLENGE_SETTLE_MS);
-
-    if (document.readyState === 'loading') {
-        document.addEventListener('DOMContentLoaded', start, { once: true });
-    }
-    else {
-        start();
-    }
-}
-
-/*
- * The attribute the hook reports through. Filled in once settings arrive; an
- * empty value simply means we do not get to confirm anything.
- */
-let statusChannel = '';
-
-/** Tells the background what happened here, for the toolbar dot. */
-function sendStatus(state, reason) {
-    try {
-        chrome.runtime.sendMessage({ request: 'ReportStatus', state, reason }, () => {
-            void chrome.runtime.lastError; // The worker may be asleep; harmless.
-        });
-    }
-    catch (e) {
-        // Extension context torn down mid-navigation.
-    }
-}
-
-/**
- * Reads the hook's note off <html>, and takes it away again.
- *
- * Removing it keeps the attribute out of the page for all but an instant. A
- * determined page can still catch it with a MutationObserver, which is why the
- * name is a random one the extension rolls each session.
- */
-function readReportedStatus() {
-    const root = document.documentElement;
-    if (!statusChannel || !root) {
-        return null;
-    }
-
-    const reported = root.getAttribute(statusChannel);
-    if (reported === null) {
-        return null;
-    }
-
-    root.removeAttribute(statusChannel);
-    return reported;
-}
-
-/**
- * Keeps listening after the initial read, because the hook can only discover
- * some things later - a worker blocked by the site's security policy is the
- * one that matters.
- */
-function watchForLaterReports() {
-    const root = document.documentElement;
-    if (!statusChannel || !root || typeof MutationObserver !== 'function') {
-        return;
-    }
-
-    new MutationObserver(() => {
-        if (readReportedStatus() === 'worker') {
-            sendStatus('partial', 'worker');
-        }
-    }).observe(root, { attributes: true, attributeFilter: [statusChannel] });
-}
-
-/**
- * The hostname to test site rules against.
- *
- * about:blank and sandboxed frames have no hostname of their own, so we use
- * the hostname of the page that created them - otherwise an ad frame on an
- * allowlisted site would quietly miss out.
- */
-function frameHostname() {
-    if (location.hostname) {
-        return location.hostname.toLowerCase();
-    }
-
-    try {
-        const ancestors = location.ancestorOrigins;
-        if (ancestors && ancestors.length) {
-            return new URL(ancestors[ancestors.length - 1]).hostname.toLowerCase();
-        }
-    }
-    catch (e) {
-        // No usable ancestor; fall through.
-    }
-
-    return '';
-}
-
-/**
- * Turns stored settings into the four values the hook takes.
- * Mirrors settings.toHookArguments in the background.
- */
-function toHookArguments(stored) {
-    const offset = Number(stored.offset);
-    const labels = stored.zoneLabels || {};
-    const isNaturalOffset = offset === Number(stored.naturalOffset);
-
-    return [
-        stored.timezone || 'Etc/GMT',
-        -1 * (Number.isFinite(offset) ? offset : 0),
-        (new Date()).getTimezoneOffset(),
-        (isNaturalOffset ? labels.standard : labels.daylight) || labels.standard || 'GMT',
-        null,
-        statusChannel,
+    const SETTING_KEYS = [
+        'timezone', 'offset', 'naturalOffset', 'zoneLabels',
+        'enabled', 'randomPerTab',
+        'siteMode', 'allowlist', 'blocklist',
+        'statusChannel', 'challengeExemptions',
     ];
-}
 
-/**
- * Runs the hook in the page's world.
- *
- * The code is set as the script's text rather than its `src`, because a `src`
- * would be fetched asynchronously and the page's own scripts would run first.
- * Inline text executes the moment the element is attached.
- *
- * Passing the settings as a function argument (rather than, say, a data
- * attribute) also keeps them out of the DOM, where the page could read them.
- */
-function runHookInPage(hookArguments) {
-    if (typeof installTimezoneHook !== 'function') {
-        return;
-    }
+    const CHALLENGE_MARKERS = [
+        'script[src*="/cdn-cgi/challenge-platform/"]',
+        '#challenge-form',
+        '#challenge-running',
+        '#cf-challenge-running',
+        'iframe[src*="challenges.cloudflare.com"]',
+        '#challenge-stage',
+        '.cf-turnstile',
+        'div[data-sitekey]',
+    ];
 
-    let code;
-    try {
-        code = `(${installTimezoneHook})(${JSON.stringify(hookArguments)});`;
-    }
-    catch (e) {
-        return;
-    }
+    const CHALLENGE_TITLES = [
+        'just a moment...',
+        'attention required! | cloudflare',
+        'checking your browser',
+        'ddos-guard',
+    ];
 
-    const script = document.createElement('script');
-    script.textContent = code;
+    const CHALLENGE_SETTLE_MS = 2000;
 
-    const root = document.documentElement || document.head || document;
-    root.prepend(script);
-    script.remove();
-}
+    let lastConfig = { enabled: false, timezone: null, ts: 0 };
+    let statusChannel = '';
 
-/**
- * Gets the hook into the page, then reports the strongest claim we can
- * honestly make.
- *
- * "unverified", never "masked", even once the hook confirms it installed: we
- * put it there from here, after an asynchronous storage read, so a script at
- * the top of the page may already have looked at the clock. Nothing we can
- * check afterwards would tell us whether one did.
- *
- * chrome.scripting goes first even though it costs a message round trip, and
- * the faster inline <script> is kept only as a last resort. The reason is that
- * there is no way to ask a page whether it allows inline scripts - you find out
- * by trying one - and a blocked attempt is not free. It is written to the
- * page's console, and it fires a securitypolicyviolation event AT THE PAGE,
- * carrying a hash of the blocked code. On a site with a strict policy that
- * happens on every single load, and it tells the site that an extension is
- * injecting into it: precisely what this extension exists to avoid.
- */
-function injectAndReport(hookArguments) {
-    chrome.runtime.sendMessage({ request: 'InjectHook' }, response => {
-        const reachedByScripting = !chrome.runtime.lastError && response && response.ok;
-
-        const settle = () => {
-            const reported = readReportedStatus();
-            if (reported === 'masked') {
-                sendStatus('unverified');
-                return true;
+    function frameHostname() {
+        if (location.hostname) {
+            return location.hostname.toLowerCase();
+        }
+        try {
+            const ancestors = location.ancestorOrigins;
+            if (ancestors && ancestors.length) {
+                return new URL(ancestors[ancestors.length - 1]).hostname.toLowerCase();
             }
-            if (reported === 'worker') {
-                sendStatus('partial', 'worker');
-                return true;
+        } catch (e) { /* ignore */ }
+        return '';
+    }
+
+    function looksLikeChallenge() {
+        if (typeof window._cf_chl_opt !== 'undefined') {
+            return true;
+        }
+
+        const title = (document.title || '').trim().toLowerCase();
+        if (CHALLENGE_TITLES.some(t => title.includes(t))) {
+            return true;
+        }
+
+        return CHALLENGE_MARKERS.some(selector => {
+            try {
+                return document.querySelector(selector) !== null;
+            } catch (e) {
+                return false;
             }
+        });
+    }
+
+    function hasClearanceCookie() {
+        try {
+            return Boolean(document.cookie && document.cookie.includes('cf_clearance='));
+        } catch (e) {
             return false;
-        };
+        }
+    }
 
-        if (statusChannel && settle()) {
+    function tellBackground(request) {
+        try {
+            chrome.runtime.sendMessage({ request }, () => {
+                void chrome.runtime.lastError;
+            });
+        } catch (e) { /* context invalidated */ }
+    }
+
+    function sendStatus(state, reason) {
+        try {
+            chrome.runtime.sendMessage({ request: 'ReportStatus', state, reason }, () => {
+                void chrome.runtime.lastError;
+            });
+        } catch (e) { /* context invalidated */ }
+    }
+
+    function dispatchConfig(cfg) {
+        lastConfig = cfg;
+        try {
+            window.dispatchEvent(new CustomEvent(EVT_CFG, {
+                detail: JSON.stringify(cfg),
+            }));
+        } catch (e) { /* page is gone */ }
+    }
+
+    function watchForChallenge(isExempt) {
+        if (window.top !== window) {
             return;
         }
 
-        /*
-         * chrome.scripting could not reach this frame. Inline is all that is
-         * left - and where chrome.scripting failed, a strict CSP is unlikely to
-         * be the reason, so this attempt is not the doomed one it looks like.
-         */
-        runHookInPage(hookArguments);
+        if (isExempt) {
+            window.addEventListener(
+                'pagehide',
+                () => tellBackground('ChallengeCleared'),
+                { once: true },
+            );
 
-        if (!statusChannel) {
-            // Nothing to confirm through, so we cannot claim more than this.
-            sendStatus('unverified');
-            return;
+            // Periodically check for clearance cookie acquisition or challenge resolution
+            const clearanceInterval = setInterval(() => {
+                if (hasClearanceCookie() && !looksLikeChallenge()) {
+                    clearInterval(clearanceInterval);
+                    tellBackground('ChallengeCleared');
+                    syncSettings();
+                }
+            }, 1000);
         }
 
-        if (settle()) {
-            return;
-        }
+        const decide = () => {
+            const onChallenge = looksLikeChallenge();
 
-        /*
-         * Nothing could run here at all. If even chrome.scripting could not
-         * reach the frame, it executes no page script either - a sandboxed
-         * iframe, or one that has already gone - so there is nothing here to
-         * read the clock and nothing to warn about.
-         */
-        sendStatus(reachedByScripting ? 'leaked' : 'off', 'no-hook');
-    });
-}
-
-function start(stored) {
-    if (chrome.runtime.lastError || !stored) {
-        return;
-    }
-
-    statusChannel = typeof stored.statusChannel === 'string' ? stored.statusChannel : '';
-
-    const hostname = frameHostname();
-    const isExempt = siteRules.hostMatches(hostname, stored.challengeExemptions);
-
-    // Runs whether or not we are masking this page: one direction watches for a
-    // challenge to step aside for, the other for the challenge being over.
-    watchForChallenge(isExempt);
-
-    if (stored.enabled === false || !siteRules.appliesTo(hostname, stored)) {
-        sendStatus('off');
-        return;
-    }
-
-    /*
-     * Has early injection already done the job? A report waiting for us before
-     * we have run a single line means the hook beat us here, and therefore beat
-     * the page's own scripts too. That is the one case that earns a green dot.
-     */
-    const initialReport = readReportedStatus();
-    watchForLaterReports();
-
-    if (initialReport === 'masked') {
-        sendStatus('masked');
-        return;
-    }
-    if (initialReport === 'worker') {
-        sendStatus('partial', 'worker');
-        return;
-    }
-
-    // Random-per-tab needs the background to say which zone this tab got, so
-    // that every frame in the tab agrees. Costs a round trip, which is why it
-    // is only done for this one mode.
-    if (stored.randomPerTab === true) {
-        chrome.runtime.sendMessage({ request: 'GetTimezone' }, hookArguments => {
-            if (chrome.runtime.lastError
-                || !Array.isArray(hookArguments) || hookArguments.length < 4) {
-                sendStatus('leaked', 'no-hook');
+            if (onChallenge && !isExempt) {
+                tellBackground('ChallengeSeen');
+                // Temporarily disable hook so challenge widget succeeds
+                dispatchConfig({ enabled: false, timezone: null, ts: Date.now() });
                 return;
             }
-            injectAndReport(hookArguments);
-        });
-        return;
+
+            if (!onChallenge && isExempt) {
+                tellBackground('ChallengeCleared');
+                syncSettings();
+            }
+        };
+
+        const start = () => setTimeout(decide, CHALLENGE_SETTLE_MS);
+
+        if (document.readyState === 'loading') {
+            document.addEventListener('DOMContentLoaded', start, { once: true });
+        } else {
+            start();
+        }
     }
 
-    injectAndReport(toHookArguments(stored));
-}
+    function syncSettings() {
+        try {
+            chrome.storage.local.get(SETTING_KEYS, stored => {
+                if (chrome.runtime.lastError || !stored) {
+                    return;
+                }
 
-chrome.storage.local.get(SETTING_KEYS, start);
+                statusChannel = typeof stored.statusChannel === 'string' ? stored.statusChannel : '';
+                const hostname = frameHostname();
+                const isExempt = siteRules && typeof siteRules.hostMatches === 'function'
+                    ? siteRules.hostMatches(hostname, stored.challengeExemptions)
+                    : false;
+
+                watchForChallenge(isExempt);
+
+                const applies = siteRules && typeof siteRules.appliesTo === 'function'
+                    ? siteRules.appliesTo(hostname, stored)
+                    : true;
+
+                if (stored.enabled === false || !applies || isExempt) {
+                    dispatchConfig({ enabled: false, timezone: null, ts: Date.now(), statusChannel });
+                    sendStatus('off');
+                    return;
+                }
+
+                // Random-per-tab query
+                if (stored.randomPerTab === true) {
+                    chrome.runtime.sendMessage({ request: 'GetTimezone' }, response => {
+                        let tz = stored.timezone;
+                        if (Array.isArray(response) && response.length > 0 && typeof response[0] === 'string') {
+                            tz = response[0];
+                        } else if (response && typeof response.timezone === 'string') {
+                            tz = response.timezone;
+                        } else if (typeof response === 'string') {
+                            tz = response;
+                        }
+                        dispatchConfig({
+                            enabled: true,
+                            timezone: tz,
+                            ts: Date.now(),
+                            statusChannel,
+                        });
+                        sendStatus('masked');
+                    });
+                    return;
+                }
+
+                dispatchConfig({
+                    enabled: true,
+                    timezone: stored.timezone,
+                    ts: Date.now(),
+                    statusChannel,
+                });
+                sendStatus('masked');
+            });
+        } catch (e) { /* context invalidated */ }
+    }
+
+    // Hook asks for configuration on start
+    window.addEventListener(EVT_REQ, () => {
+        dispatchConfig(lastConfig);
+    }, true);
+
+    // Live update when popup or background changes storage
+    try {
+        chrome.storage.onChanged.addListener((changes, area) => {
+            if (area === 'local') {
+                syncSettings();
+            }
+        });
+    } catch (e) { /* ignore */ }
+
+    // Initial sync
+    syncSettings();
+})();

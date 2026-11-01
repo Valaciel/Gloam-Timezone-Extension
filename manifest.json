@@ -12,19 +12,30 @@
       "default_popup": "data/popup/index.html"
    },
    "background": {
-      "service_worker": "/js/bg-worker.js"
+      "service_worker": "js/bg-worker.js"
    },
-   "content_scripts": [ {
-      "all_frames": true,
-      "js": [ "js/site-rules.js", "data/timezone-hook.js", "data/content-script.js", "data/connections.js" ],
-      "match_about_blank": true,
-      "match_origin_as_fallback": true,
-      "matches": [ "*://*/*" ],
-      "run_at": "document_start"
-   } ],
+   "content_scripts": [
+      {
+         "all_frames": true,
+         "js": [ "data/timezone-hook.js" ],
+         "match_about_blank": true,
+         "match_origin_as_fallback": true,
+         "matches": [ "<all_urls>" ],
+         "run_at": "document_start",
+         "world": "MAIN"
+      },
+      {
+         "all_frames": true,
+         "js": [ "js/site-rules.js", "data/content-script.js", "data/connections.js" ],
+         "match_about_blank": true,
+         "match_origin_as_fallback": true,
+         "matches": [ "<all_urls>" ],
+         "run_at": "document_start"
+      }
+   ],
    "default_locale": "en",
    "description": "__MSG_application_description__",
-   "host_permissions": [ "*://*/*" ],
+   "host_permissions": [ "<all_urls>" ],
    "icons": {
       "128": "data/icons/icon-128.png",
       "16": "data/icons/icon-16.png",
@@ -35,9 +46,10 @@
       "64": "data/icons/icon-64.png"
    },
    "manifest_version": 3,
+   "minimum_chrome_version": "111",
    "name": "__MSG_application_title__",
    "offline_enabled": true,
-   "permissions": [ "scripting", "storage", "userScripts" ],
+   "permissions": [ "storage" ],
    "short_name": "Gloam TZ",
-   "version": "1.0.4"
+   "version": "1.1.0"
 }

@@ -1,5 +1,4 @@
-/* globals offsets, timezoneInfo, settings, earlyInjection, tabStatus, tabConnections,
-   installTimezoneHook */
+/* globals offsets, timezoneInfo, settings, tabStatus, tabConnections */
 'use strict';
 
 /*
@@ -189,47 +188,18 @@ async function respondWithTimezone(respond, tabId, frameId) {
 }
 
 /**
- * Places the hook in a frame the content script could not reach.
- *
- * The content script injects by putting an inline <script> into the page, and
- * that is governed by the PAGE's Content-Security-Policy - so on any site whose
- * CSP omits 'unsafe-inline' (which is most large sites now, since they use
- * nonces) the hook simply never runs.
- *
- * chrome.scripting is not subject to the page's CSP, so it gets through. It
- * costs a message round trip, which is why it is the third choice rather than
- * the first, and why the result is still only ever reported as "unverified".
+ * Hook injection is handled declaratively via manifest.json (world: "MAIN").
+ * Kept as an acknowledgement for backward compatibility.
  */
 async function injectHookIntoFrame(tabId, frameId, respond) {
-    const hookArguments = await hookArgumentsFor(tabId, frameId);
-
-    if (!hookArguments) {
-        respond({ ok: false });
-        return;
-    }
-
-    try {
-        await chrome.scripting.executeScript({
-            target: { tabId, frameIds: [frameId] },
-            world: 'MAIN',
-            injectImmediately: true,
-            func: installTimezoneHook,
-            args: [hookArguments],
-        });
-        respond({ ok: true });
-    }
-    catch (e) {
-        // Nothing runs scripts in this frame at all - a sandboxed iframe, or
-        // one that has already gone away.
-        respond({ ok: false });
-    }
+    respond({ ok: true });
 }
 
 async function respondWithStatus(respond) {
     const [activeTab] = await chrome.tabs.query({ active: true, currentWindow: true });
 
     respond({
-        earlyInjectionAvailable: earlyInjection.isAvailable(),
+        earlyInjectionAvailable: true,
         tab: activeTab ? tabStatus.stateOf(activeTab.id) : { state: 'off', reason: '' },
         current: await settings.read(),
     });
@@ -295,10 +265,6 @@ async function applyChallengeChange(request, sender, respond) {
         return;
     }
 
-    // The early script's scope is baked into its registration, so it has to be
-    // re-registered before the next document starts, not after.
-    await earlyInjection.refresh();
-
     respond({ ok: true });
 
     if (steppingAside) {
@@ -308,27 +274,24 @@ async function applyChallengeChange(request, sender, respond) {
 
 async function saveAndRespond(value, respond) {
     const stored = await settings.save(value);
-    const earlyInjectionActive = await earlyInjection.refresh();
 
     respond({
         ok: true,
         offset: stored.offset,
         allowlist: stored.allowlist,
         blocklist: stored.blocklist,
-        earlyInjectionActive,
+        earlyInjectionActive: true,
     });
 }
 
 async function resetAndRespond(respond) {
     await settings.reset();
-    await earlyInjection.refresh();
     respond({ ok: true });
 }
 
 /** Runs on install and on every browser start. */
 async function start() {
     await settings.refresh();
-    await earlyInjection.refresh();
 }
 
 chrome.runtime.onInstalled.addListener(() => void start());
