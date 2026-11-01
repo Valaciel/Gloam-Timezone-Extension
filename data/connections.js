@@ -26,102 +26,129 @@
  * quietly missing.
  */
 
-// Counted per host, so a domain pulled in once looks different from one being
-// talked to constantly.
-const hitsByHost = new Map();
+(function () {
+    // Counted per host, so a domain pulled in once looks different from one being
+    // talked to constantly.
+    const hitsByHost = new Map();
 
-function noteUrl(rawUrl) {
-    let hostname;
-    try {
-        hostname = new URL(rawUrl, location.href).hostname.toLowerCase();
-    }
-    catch (e) {
-        return;
-    }
+    function noteUrl(rawUrl) {
+        let hostname;
+        try {
+            hostname = new URL(rawUrl, location.href).hostname.toLowerCase();
+        }
+        catch (e) {
+            return;
+        }
 
-    // data:, blob: and about: URLs have no host and are not connections.
-    if (!hostname) {
-        return;
-    }
+        // data:, blob: and about: URLs have no host and are not connections.
+        if (!hostname) {
+            return;
+        }
 
-    hitsByHost.set(hostname, (hitsByHost.get(hostname) || 0) + 1);
-}
-
-function watch() {
-    if (typeof PerformanceObserver !== 'function') {
-        return;
+        hitsByHost.set(hostname, (hitsByHost.get(hostname) || 0) + 1);
     }
 
-    try {
-        new PerformanceObserver(list => {
-            for (const entry of list.getEntries()) {
-                noteUrl(entry.name);
+    /** Harvests resource entries directly from performance timeline buffer as fallback. */
+    function harvestExistingEntries() {
+        if (typeof performance === 'undefined' || typeof performance.getEntriesByType !== 'function') {
+            return;
+        }
+        try {
+            const entries = performance.getEntriesByType('resource');
+            if (Array.isArray(entries)) {
+                for (const entry of entries) {
+                    if (entry && entry.name) {
+                        noteUrl(entry.name);
+                    }
+                }
             }
-        }).observe({ type: 'resource', buffered: true });
-    }
-    catch (e) {
-        // Resource timing unavailable in this frame; the panel copes with an
-        // empty list.
-    }
-}
-
-/**
- * The host this frame belongs to.
- *
- * Mirrors content-script.js's frameHostname(): a sandboxed or about:blank frame
- * has no host of its own, so it is attributed to whatever opened it. (Kept
- * under a different name because every content script in this entry shares one
- * scope, so two files cannot both declare it.)
- */
-function owningHostname() {
-    if (location.hostname) {
-        return location.hostname.toLowerCase();
-    }
-
-    try {
-        const ancestors = location.ancestorOrigins;
-        if (ancestors && ancestors.length) {
-            return new URL(ancestors[ancestors.length - 1]).hostname.toLowerCase();
+        }
+        catch (e) {
+            // Buffer access restricted.
         }
     }
-    catch (e) {
-        // No usable ancestor.
+
+    function watch() {
+        if (typeof PerformanceObserver !== 'function') {
+            harvestExistingEntries();
+            return;
+        }
+
+        try {
+            new PerformanceObserver(list => {
+                for (const entry of list.getEntries()) {
+                    noteUrl(entry.name);
+                }
+            }).observe({ type: 'resource', buffered: true });
+        }
+        catch (e) {
+            // Resource timing observer unavailable or buffered: true unsupported;
+            // fallback to reading buffer directly.
+            harvestExistingEntries();
+        }
     }
 
-    return '';
-}
+    /**
+     * The host this frame belongs to.
+     *
+     * A sandboxed or about:blank frame has no host of its own, so it is attributed
+     * to whatever opened it.
+     */
+    function owningHostname() {
+        if (location.hostname) {
+            return location.hostname.toLowerCase();
+        }
 
-/*
- * The popup asks the background, the background asks every frame, and each
- * frame answers with a message of its own rather than through sendResponse -
- * a broadcast to a tab only ever delivers one frame's reply, and the whole
- * point here is to hear from all of them.
- *
- * The scan token comes straight back so the background can tell this answer
- * from one left over by a previous page.
- */
-chrome.runtime.onMessage.addListener((message, sender) => {
-    if (sender.id !== chrome.runtime.id || !message || message.request !== 'CollectConnections') {
+        try {
+            const ancestors = location.ancestorOrigins;
+            if (ancestors && ancestors.length) {
+                return new URL(ancestors[ancestors.length - 1]).hostname.toLowerCase();
+            }
+        }
+        catch (e) {
+            // No usable ancestor.
+        }
+
+        return '';
+    }
+
+    /*
+     * The popup asks the background, the background asks every frame, and each
+     * frame answers with a message of its own rather than through sendResponse -
+     * a broadcast to a tab only ever delivers one frame's reply, and the whole
+     * point here is to hear from all of them.
+     *
+     * The scan token comes straight back so the background can tell this answer
+     * from one left over by a previous page.
+     */
+    chrome.runtime.onMessage.addListener((message, sender) => {
+        if (sender.id !== chrome.runtime.id || !message || message.request !== 'CollectConnections') {
+            return false;
+        }
+
+        // If observer hasn't flushed entries or was delayed, harvest available buffer entries
+        if (hitsByHost.size === 0) {
+            harvestExistingEntries();
+        }
+
+        const hosts = [...hitsByHost].map(([host, hits]) => ({ host, hits }));
+
+        try {
+            chrome.runtime.sendMessage({
+                request: 'ReportConnections',
+                token: message.token,
+                frameHost: owningHostname(),
+                hosts,
+            }, () => {
+                void chrome.runtime.lastError;
+            });
+        }
+        catch (e) {
+            // Extension context torn down mid-navigation.
+        }
+
         return false;
-    }
+    });
 
-    const hosts = [...hitsByHost].map(([host, hits]) => ({ host, hits }));
-
-    try {
-        chrome.runtime.sendMessage({
-            request: 'ReportConnections',
-            token: message.token,
-            frameHost: frameHostname(),
-            hosts,
-        }, () => {
-            void chrome.runtime.lastError;
-        });
-    }
-    catch (e) {
-        // Extension context torn down mid-navigation.
-    }
-
-    return false;
-});
-
-watch();
+    watch();
+})();

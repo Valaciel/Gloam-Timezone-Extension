@@ -58,6 +58,10 @@ once a challenge is passed without waiting for arbitrary settle timeouts.
 - **Explicit verification iframe exclusion.** Turnstile verification iframes are
 strictly excluded from adoption, preventing verification spinner hangs.
 
+### Fixed
+
+- **Links panel Rescan and connection reporting failure.** Calling `frameHostname()` instead of `owningHostname()` in `data/connections.js` caused an unhandled `ReferenceError` when frames reported observed connections, causing the Links panel to report pages as unreadable and leaving Rescan non-functional. `data/connections.js` is now properly encapsulated with defensive timeline harvesting (fixes #3).
+
 ### Removed
 
 - **The Developer Mode / "Allow user scripts" prerequisite.** Early injection is now
