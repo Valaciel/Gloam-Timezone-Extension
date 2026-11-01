@@ -11,6 +11,58 @@ was ever distributed. Early commits carry `1.0.1` in the manifest throughout —
 the numbering was settled when this file was written, and 1.0.0 is what that
 first build is called here.
 
+## 1.1.0 — 2026-11-01
+
+The timezone override moves to native main-world declarative injection, eliminating
+the asynchronous storage race on page load and removing the need for the browser's
+"Allow user scripts" toggle. Prototype subclassing is replaced with zero-allocation
+in-place patching, dynamic iframes are adopted on access, and challenge detection
+now tracks clearance cookies.
+
+### Changed
+
+- **Native main-world injection via `manifest.json`.** Rather than relying on
+`chrome.userScripts` or falling back to asynchronous isolated-world content script
+injection, the timezone hook is now declared statically with `world: "MAIN"` at
+`document_start`. The browser engine guarantees it executes in the page context before
+any inline or external page script can run.
+- **`Date.prototype` is patched in place instead of subclassed.** Replacing `Date` with
+a subclass (`class FakeZoneDate extends RealDate`) and maintaining partner dates in a
+`WeakMap` caused heavy garbage collection pressure on date-heavy pages and subtle
+divergences in `instanceof`, cross-realm checks, and `structuredClone`. All local-time
+methods are now patched directly on `Date.prototype` with zero per-instance allocations.
+- **Permissions reduced to `"storage"` only.** Because injection is handled natively
+by the manifest declaration, the elevated `"scripting"` and `"userScripts"` permissions
+are no longer needed. The extension requests zero host or scripting permissions on install.
+- **`Intl.DateTimeFormat` no longer wraps formatters in a `Proxy`.** Formatter instances
+are constructed natively with default timezone options injected, preserving internal
+engine brand slots and speeding up locale formatting in tight loops.
+- **Daily offset caching.** Offsets are now verified across day boundaries ($t_0$ and $t_1$).
+Constant days are cached in a single lookup, reducing cache churn by 24x compared to
+hourly tracking.
+
+### Added
+
+- **Dynamic iframe trapping.** Scripts generating `about:blank` or `srcdoc` iframes
+dynamically to read unpatched prototypes are now intercepted at the prototype layer:
+accessing `HTMLIFrameElement.prototype.contentWindow` or `contentDocument` immediately
+adopts and patches the child window before the caller receives it.
+- **ECMA-262 compliant local-time math.** Ambiguous repeated and skipped hours across
+daylight saving boundaries now strictly follow the ECMAScript specification, using the
+offset in force prior to transition.
+- **Chromium V8 `EquivalentYear` emulation.** `Date.prototype.toString()` output for
+dates before 1970 and after 2038 now matches the engine's internal daylight label logic.
+- **Cookie-aware challenge clearance.** Anti-bot challenge detection now monitors for
+the `cf_clearance` cookie in addition to page transitions, immediately restoring protection
+once a challenge is passed without waiting for arbitrary settle timeouts.
+- **Explicit verification iframe exclusion.** Turnstile verification iframes are
+strictly excluded from adoption, preventing verification spinner hangs.
+
+### Removed
+
+- **The Developer Mode / "Allow user scripts" prerequisite.** Early injection is now
+the only path and is active for all users out of the box.
+
 ## 1.0.4 — 2026-08-27
 
 Unresolved merge conflict markers had been committed into the shipped extension.

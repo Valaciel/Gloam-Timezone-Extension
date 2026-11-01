@@ -36,41 +36,28 @@ Workers.
 2. Turn on **Developer mode**.
 3. **Load unpacked**, and select this folder.
 
-### Turn on "Allow user scripts"
-
-On the extension's card in `chrome://extensions`, enable **Allow user scripts**.
-
-This matters more than it sounds. It switches the extension from the fallback
-path to the early-injection path — see below. The popup shows which one is
-currently active.
+Early injection runs natively out of the box at `document_start` on Chromium 111+ without requiring special toggles or elevated permissions.
 
 ## How injection works
 
-There are three paths, tried in this order.
+Gloam uses a two-tier architecture combining native Chromium Manifest V3 declarative injection with an isolated-world configuration bridge:
 
-**Early injection (fast path, requires "Allow user scripts").** The settings are
-compiled directly into a script string and registered through
-`chrome.userScripts` to run in the page's own world at `document_start`. Since
-the values are already inside the code, there is nothing to await, so it always
-runs before any page script. See [`js/early-injection.js`](js/early-injection.js).
+1. **Native Main-World Injection ([`data/timezone-hook.js`](data/timezone-hook.js)).**
+   Declared statically in `manifest.json` under `content_scripts` with `"world": "MAIN"` at `document_start`. The browser engine guarantees it executes in the page context before any inline or external page script can run.
+   - **In-place prototype patching**: Mutates methods directly on `Date.prototype` rather than replacing `Date` with a subclass. Reuses a single static `scratch` Date object for all getters, ensuring strictly $O(1)$ memory overhead with zero extra object allocations.
+   - **ECMA-262 compliance**: All local-time math flows through `offsetAt(t)` and `localToUTC(L)` adhering to the ECMAScript specification for daylight saving transitions. Local setters delegate to native `setUTC*` methods on local fields.
+   - **Dynamic iframe trapping**: Traps `HTMLIFrameElement.prototype.contentWindow` and `contentDocument` via prototype getters (`adopt`), ensuring scripts that dynamically mint `about:blank` or `srcdoc` iframes never see unpatched native prototypes.
+   - **Clean `Intl.DateTimeFormat`**: Injects default timezone options into constructor arguments without wrapping formatters in a `Proxy`, preserving internal V8 brand slots.
 
-**Content script (fallback).** Runs at `document_start` in the isolated world,
-reads settings from storage, then asks the background to place the hook through
-`chrome.scripting` with `world: 'MAIN'`. Reading storage is asynchronous, so a
-page whose first inline script reads the clock immediately can win the race. See
-[`data/content-script.js`](data/content-script.js).
+2. **Isolated-World Bridge ([`data/content-script.js`](data/content-script.js)).**
+   Runs at `document_start` in the extension's isolated world where it can safely access extension storage and APIs.
+   - Reads stored settings and evaluates site rules (allowlist, blocklist, or all sites).
+   - Monitors for anti-bot challenges and temporarily steps aside so challenge widgets pass cleanly.
+   - Dispatches verified settings to the main-world hook via custom window events (`__gloam_tz_cfg` and `__gloam_tz_req`).
+   - Listens to `chrome.storage.onChanged` to forward settings edits live across all open tabs and child frames without requiring a page reload.
 
-**Inline `<script>` (last resort).** Faster than the above — no round trip — but
-it is only tried when `chrome.scripting` could not reach the frame. An inline
-script added by a content script is governed by the **page's** CSP, and there is
-no way to ask a page whether it allows one except by trying: a blocked attempt
-is logged to the page's console *and* fires a `securitypolicyviolation` event at
-the page, carrying a hash of the blocked code. On a strict site that happens
-every load and tells the site an extension is injecting into it — so this is
-last, not first.
-
-Whichever lands first wins; the hook's install guard makes later attempts
-no-ops.
+3. **Zero CSP Friction.**
+   Because injection is handled declaratively by Chromium's manifest engine, page Content Security Policies (`script-src`) cannot block the hook. No inline `<script>` tags or `chrome.scripting` round-trips are needed.
 
 ## Bot checks
 
@@ -80,33 +67,17 @@ reloads itself forever. The extension steps out of the way instead:
 
 1. Challenge detected on a masked page → exempt the host, reload
 2. Challenge passes, unmasked
-3. The challenge page **unloads** → drop the exemption, no reload
+3. Challenge resolution or `cf_clearance` cookie detected → drop the exemption, no reload
 4. The next document is masked from its first line
 
-Only step 1 reloads, and that matters. The obvious way to write step 3 — wait
-for the next page, see that the challenge is gone, then reload with the mask
-back on — is wrong twice over. By the time you can see the challenge is gone,
-the real site has already loaded and run its scripts unmasked, and reloading
-does not take that back. And a challenge is often cleared by a POST, so the
-reload makes Chrome ask the user to confirm resubmitting the form.
+Only step 1 reloads, and that matters. The exemption is dropped the moment
+clearance is verified (via `cf_clearance` cookie acquisition or on `pagehide`
+as the challenge page unloads), so the next document is masked from its first
+line with no reload and no form-resubmission prompts.
 
-Dropping the exemption on `pagehide` avoids both: it happens before the next
-document exists, so that document is covered from the start with no reload and
-nothing leaked.
-
-There is still a safety net for the case where the challenge clears without the
-document ever unloading. That one *is* a leak, it cannot be undone, and it is
-reported as a red dot saying so rather than papered over with a reload.
-
-The exemption lasts for one challenge, not for the session. If a site
-challenges again *after* step 4, the cycle is not restarted — the host is left
-unmasked for the rest of the session, because the alternative is a tab that
-reloads forever. Everything is cleared at browser start, so no site is written
-off for good.
-
-`challenges.cloudflare.com` is never masked at all. It is the iframe the widget
-runs in, it has no interest in you beyond whether the browser is real, and
-masking it only breaks the check.
+`challenges.cloudflare.com` and challenge platform verification frames are
+strictly excluded from adoption at the prototype layer, preventing verification
+spinner hangs while keeping the rest of the page protected.
 
 This is **not** a way around a bot check, and it does not try to be. If a site
 challenges you because your IP and your reported timezone disagree, that is the
@@ -131,8 +102,9 @@ leaked* — and the full sentence on hover. The colours are written out under
 
 Green versus amber is the whole point of having the first two states. "We
 injected the hook" is not the same claim as "nothing read the clock before us",
-and a privacy tool that blurs the two is lying to its user. In practice, turning
-on "Allow user scripts" is what turns amber into green.
+and a privacy tool that blurs the two is lying to its user. With native
+declarative injection at `document_start`, the hook is guaranteed to be in place
+before the page's own scripts run, reliably earning a green dot.
 
 Red is reserved for the page's own world. An uncovered worker is a real leak and
 gets its own colour to say so, but it is a gap in one corner of a page that is
@@ -213,13 +185,8 @@ the one clicked, because the per-host button is always exact.
 
 ## Known leaks
 
-Honest list. None of these are common, but they are real. The first two are the
-ones the dot exists to tell you about.
+Honest list. None of these are common, but they are real.
 
-- **The fallback path loses races.** Without "Allow user scripts", a page that
-  reads the clock in its very first inline script can see the real timezone.
-  This is the default state of a fresh install, and it is the single biggest
-  reason to enable the toggle. Shows as an amber dot.
 - **URL-based workers on strict-CSP sites.** A worker started from an ordinary
   URL can only be hooked by re-pointing it at a generated `blob:` URL — a change
   the site never asked for. Where a Content-Security-Policy forbids `blob:`
@@ -248,16 +215,15 @@ ones the dot exists to tell you about.
 manifest.json           MV3 manifest
 js/
   bg-worker.js          service worker entry
-  background.js         wiring: settings changes -> re-registration
+  background.js         wiring: settings changes -> status & challenge updates
   settings.js           storage schema, defaults, migration
   site-rules.js         allowlist/blocklist matching (shared)
-  early-injection.js    userScripts registration (fast path)
   tab-status.js         the coloured dot on the toolbar icon
   tab-connections.js    asks a tab's frames which hosts they fetched from
   timezone-info.js      zone lookup and labels
 data/
-  timezone-hook.js      the hook itself — patches Date, Intl and Temporal
-  content-script.js     fallback injection path
+  timezone-hook.js      main-world hook — patches Date, Intl, Temporal, and dynamic iframes
+  content-script.js     isolated-world bridge — evaluates site rules and challenge status
   connections.js        per-frame tally of hosts the page loaded from
   offsets.js            IANA zone table
   popup/                popup UI — one file per section of the side nav
@@ -265,10 +231,10 @@ data/
 _locales/en/            extension name and description
 ```
 
-`data/timezone-hook.js` only *defines* `installTimezoneHook`; it never runs on
-its own. Three places load it: the background (as a registered user script), the
-content script (as the fallback), and the hook itself (inside each Web Worker).
-Because of the worker case it must never touch `document`.
+`data/timezone-hook.js` runs in the page's `MAIN` world at `document_start`,
+installing in-place prototype traps before any page script executes.
+`data/content-script.js` acts as an isolated-world bridge, querying extension
+storage and dispatching configuration events to the hook.
 
 ## Development notes
 
@@ -284,13 +250,12 @@ Because of the worker case it must never touch `document`.
 | Permission | Why |
 | --- | --- |
 | `storage` | Save your settings |
-| `userScripts` | Early injection at `document_start` |
-| `scripting` | Reaching pages whose CSP blocks the inline fallback |
-| `*://*/*` host access | The hook has to run on the sites you visit |
+| `<all_urls>` host access | The hook has to run on the sites you visit |
 
-No data leaves your machine. Note what is *not* here: the Links panel reads what
-each page already knows about its own subresources, so listing a tab's
-connections needs no `webRequest` and adds no permission at all.
+No data leaves your machine. Note what is *not* here: the extension requires
+zero elevated scripting permissions (`scripting` and `userScripts` are not needed),
+and the Links panel reads what each page already knows about its own subresources
+without needing `webRequest`.
 
 ## License
 
