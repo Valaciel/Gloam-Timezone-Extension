@@ -11,6 +11,14 @@ was ever distributed. Early commits carry `1.0.1` in the manifest throughout —
 the numbering was settled when this file was written, and 1.0.0 is what that
 first build is called here.
 
+## 1.1.1 — 2026-11-01
+
+The Links panel connection reporter is restored.
+
+### Fixed
+
+- **Links panel Rescan and connection reporting failure.** Calling `frameHostname()` instead of `owningHostname()` in `data/connections.js` caused an unhandled `ReferenceError` when frames reported observed connections, causing the Links panel to report pages as unreadable and leaving Rescan non-functional. `data/connections.js` is now properly encapsulated with defensive timeline harvesting (fixes #3).
+
 ## 1.1.0 — 2026-11-01
 
 The timezone override moves to native main-world declarative injection, eliminating
@@ -57,10 +65,6 @@ the `cf_clearance` cookie in addition to page transitions, immediately restoring
 once a challenge is passed without waiting for arbitrary settle timeouts.
 - **Explicit verification iframe exclusion.** Turnstile verification iframes are
 strictly excluded from adoption, preventing verification spinner hangs.
-
-### Fixed
-
-- **Links panel Rescan and connection reporting failure.** Calling `frameHostname()` instead of `owningHostname()` in `data/connections.js` caused an unhandled `ReferenceError` when frames reported observed connections, causing the Links panel to report pages as unreadable and leaving Rescan non-functional. `data/connections.js` is now properly encapsulated with defensive timeline harvesting (fixes #3).
 
 ### Removed
 
