@@ -289,10 +289,54 @@ async function resetAndRespond(respond) {
     respond({ ok: true });
 }
 
+/**
+ * Reconciles open tabs on browser startup or service worker launch.
+ *
+ * Checks all currently open tabs. If a web tab has an active content script,
+ * PingStatus brings stateByTab up to date. If an active web tab was restored
+ * from cache without content scripts (common on "Continue where you left off"),
+ * reloads the tab so it executes fresh under the declarative timezone hook.
+ */
+async function reconcileTabs() {
+    try {
+        const tabs = await chrome.tabs.query({});
+        const WEB_URL = /^https?:/i;
+
+        for (const tab of tabs) {
+            const url = tab.url || tab.pendingUrl || '';
+            // Only examine web pages we are intended to cover
+            if (!url || !WEB_URL.test(url)) {
+                continue;
+            }
+
+            // Ping the content script in the top frame of the tab
+            chrome.tabs.sendMessage(tab.id, { request: 'PingStatus' }, response => {
+                const err = chrome.runtime.lastError;
+                // If receiving end does not exist, the tab was restored without content scripts
+                if (err && tab.active) {
+                    // Only reload active/focused tabs to avoid mass un-discarding background tabs
+                    chrome.tabs.reload(tab.id);
+                }
+            });
+        }
+    } catch (e) {
+        // Tab query failed or extension context shutting down
+    }
+}
+
 /** Runs on install and on every browser start. */
 async function start() {
     await settings.refresh();
+    await reconcileTabs();
 }
 
 chrome.runtime.onInstalled.addListener(() => void start());
 chrome.runtime.onStartup.addListener(() => void start());
+
+// Re-verify tab status when switching between tabs
+chrome.tabs.onActivated.addListener(({ tabId }) => {
+    chrome.tabs.sendMessage(tabId, { request: 'PingStatus' }, () => {
+        void chrome.runtime.lastError;
+    });
+});
+
