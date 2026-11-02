@@ -206,27 +206,23 @@ tabStatus.forget = tabId => {
 };
 
 /**
- * Clear the dot when a tab moves somewhere no content script will ever run -
- * chrome://settings, the web store, a PDF viewer. Those pages never report, so
- * without this the previous page's dot would sit there looking authoritative.
+ * Clear the dot only when a tab is confirmed to have navigated somewhere
+ * no content script will run - chrome://settings, extension pages, devtools,
+ * or edge://.
  *
- * Reading the URL here is slightly indirect. Chrome only tells an extension a
- * tab's URL when it has permission for that URL, and our host permissions are
- * exactly the pages we run on - so "we cannot see the URL" is itself the signal
- * that this is a page we have no business on.
- *
- * The upshot is that pages we DO cover never take this branch, so clearing can
- * never race a report that has already arrived.
+ * An empty or uncommitted URL during early loading (such as startup tab
+ * restoration before navigation commit) must NOT clear the status, otherwise
+ * startup tabs lose their masked state and revert to 'off'.
  */
-const RUNNABLE_URL = /^(?:https?:|about:blank)/i;
+const RESTRICTED_SCHEME = /^(?:chrome|chrome-extension|edge|devtools|view-source):/i;
 
 chrome.tabs.onUpdated.addListener((tabId, changeInfo, tab) => {
     if (changeInfo.status !== 'loading') {
         return;
     }
 
-    const url = changeInfo.url || (tab && tab.url) || '';
-    if (!RUNNABLE_URL.test(url)) {
+    const url = changeInfo.url || (tab && tab.url) || (tab && tab.pendingUrl) || '';
+    if (url && RESTRICTED_SCHEME.test(url)) {
         tabStatus.forget(tabId);
         void paint(tabId, 'off');
     }

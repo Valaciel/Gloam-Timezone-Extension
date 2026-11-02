@@ -11,6 +11,14 @@ was ever distributed. Early commits carry `1.0.1` in the manifest throughout —
 the numbering was settled when this file was written, and 1.0.0 is what that
 first build is called here.
 
+## 1.1.2 — 2026-11-02
+
+Startup tabs and session-restored pages are now reliably covered on browser launch.
+
+### Fixed
+
+- **Startup tabs remained unmasked on browser launch until manually refreshed.** When Chrome launched with "Continue where you left off" or designated startup pages, premature scheme checks in `chrome.tabs.onUpdated` cleared tab status during early loading, and session-restored tabs that bypassed cold declarative injection were left unmasked. Tab scheme filtering now properly guards uncommitted URLs, background startup reconciles all open tabs via `PingStatus`, and active startup tabs missing injection are automatically recovered (fixes #5).
+
 ## 1.1.1 — 2026-11-01
 
 The Links panel connection reporter is restored.

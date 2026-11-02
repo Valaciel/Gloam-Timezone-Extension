@@ -228,6 +228,24 @@
         dispatchConfig(lastConfig);
     }, true);
 
+    // Respond to background reconciliation requests (e.g. browser startup / worker wakeup)
+    try {
+        chrome.runtime.onMessage.addListener((message, sender, respond) => {
+            if (sender.id !== chrome.runtime.id) {
+                return false;
+            }
+            if (message && message.request === 'PingStatus') {
+                const currentState = lastConfig && lastConfig.enabled ? 'masked' : 'off';
+                sendStatus(currentState);
+                if (typeof respond === 'function') {
+                    respond({ ok: true, state: currentState });
+                }
+                return false;
+            }
+            return false;
+        });
+    } catch (e) { /* context invalidated */ }
+
     // Live update when popup or background changes storage
     try {
         chrome.storage.onChanged.addListener((changes, area) => {
